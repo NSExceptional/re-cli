@@ -67,6 +67,7 @@ function resolveTools(config: Config): Config {
   ], 'idat64');
 
   const hopper = config.tools.hopper || findTool('RE_HOPPER', [
+    '/Applications/Hopper Disassembler.app/Contents/MacOS/hopper',
     '/Applications/Hopper Disassembler v5.app/Contents/MacOS/hopper',
     '/Applications/Hopper Disassembler v4.app/Contents/MacOS/hopper',
     '/Applications/Hopper.app/Contents/MacOS/hopper',

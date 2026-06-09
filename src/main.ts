@@ -310,6 +310,14 @@ function cmdDsc(
 
   const { backend, noCache, noIdbCache, timeout, format } = globalRunOpts(flags, config);
 
+  if (backend === 'hopper') {
+    throw new Error(
+      "Hopper backend doesn't support DSC modules — Hopper's DSC loader always shows " +
+      "an interactive module-picker dialog that can't be bypassed via its scripting interface. " +
+      "Use --backend ida (or the default) for DSC analysis."
+    );
+  }
+
   const result = run({
     backend: backend as 'auto' | BackendName,
     command: sub,
