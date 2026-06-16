@@ -247,11 +247,11 @@ function cmdCache(
 
 // ─── DSC subcommand ──────────────────────────────────────────────────────────
 
-function cmdDsc(
+async function cmdDsc(
   args: string[],
   flags: Record<string, string | boolean>,
   config: ReturnType<typeof loadConfig>,
-): void {
+): Promise<void> {
   const [sub, ...rest] = args;
   if (!sub) {
     process.stderr.write(
@@ -318,7 +318,7 @@ function cmdDsc(
     );
   }
 
-  const result = run({
+  const result = await run({
     backend: backend as 'auto' | BackendName,
     command: sub,
     binary: dscPath,
@@ -379,7 +379,7 @@ Global flags:
   --backend    ida | hopper | auto   (default: auto, prefers IDA)
   --arch       arm64 | x86_64        Extract slice from fat binary before analysis
                                      (for DSC: pick the matching DSC arch file)
-  --timeout    seconds               (default: 300)
+  --timeout    seconds               Optional hard cap (default: none — runs to completion)
   --no-cache                         Skip result cache
   --no-idb-cache                     Force re-analysis even if .i64 exists
   --format     json | pretty         (default: json)
@@ -413,7 +413,7 @@ function pick(
   return out;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
 
   if (!command || flags['help'] || flags['h']) {
@@ -431,7 +431,7 @@ function main(): void {
 
   if (command === 'dsc') {
     try {
-      cmdDsc(positional, flags, config);
+      await cmdDsc(positional, flags, config);
     } catch (e) {
       process.stderr.write(`Error: ${e instanceof Error ? e.message : String(e)}\n`);
       process.exit(1);
@@ -451,7 +451,7 @@ function main(): void {
     process.exit(1);
   }
 
-  const result = run({
+  const result = await run({
     backend: backend as 'auto' | BackendName,
     command,
     binary,

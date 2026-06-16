@@ -1,10 +1,10 @@
 import { existsSync, readFileSync, writeFileSync, rmSync, statSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import type { BackendName } from './backends/types.ts';
 import type { Config } from './config.ts';
 import type { REResult } from './result.ts';
@@ -67,18 +67,69 @@ function composeScript(
   return preamble + '\n' + readFileSync(basePath, 'utf8') + '\n' + readFileSync(bodyPath, 'utf8');
 }
 
+// Run the backend asynchronously and narrate progress to STDERR. A blocking
+// spawnSync would freeze the event loop for the whole (possibly multi-minute)
+// analysis and discard the disassembler's output, so a caller — human or
+// program — sees nothing until it finishes or is killed, indistinguishable from
+// a hang. Instead we stream a heartbeat (with the tail of the backend's own log)
+// so the run is observably alive. stdout stays reserved for the JSON result.
 function spawnTool(
   cmd: string,
   args: string[],
   timeoutMs: number,
+  logPath: string,
+  label: string,
   extraEnv?: Record<string, string>,
-): { timedOut: boolean; exitCode: number } {
-  const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
-  const result = spawnSync(cmd, args, { stdio: 'ignore', timeout: timeoutMs, env });
-  const timedOut =
-    result.signal === 'SIGTERM' ||
-    (result.error != null && result.error.message.includes('ETIMEDOUT'));
-  return { timedOut, exitCode: result.status ?? 0 };
+): Promise<{ timedOut: boolean; exitCode: number }> {
+  return new Promise((resolve) => {
+    const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
+    const start = Date.now();
+    const child = spawn(cmd, args, { stdio: 'ignore', env });
+
+    let timedOut = false;
+    let settled = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+    // Stay silent for the first few seconds so fast cache reloads make no noise;
+    // only narrate runs that are actually slow.
+    const banner = setTimeout(() => {
+      process.stderr.write(`[re] ${label} — working, this can take several minutes…\n`);
+      heartbeat = setInterval(() => {
+        const secs = Math.round((Date.now() - start) / 1000);
+        let tail = '';
+        try {
+          if (existsSync(logPath)) {
+            const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n');
+            const last = lines[lines.length - 1]?.trim().slice(0, 100);
+            if (last) tail = `  ${last}`;
+          }
+        } catch {}
+        process.stderr.write(`[re] …${secs}s elapsed${tail}\n`);
+      }, 10_000);
+    }, 3_000);
+
+    // A timeout is opt-in (--timeout N). With none, analysis runs to completion —
+    // large binaries legitimately take many minutes, and the heartbeat above keeps
+    // the run observable so a watcher can intervene if it ever truly hangs.
+    const killer = timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGKILL');
+        }, timeoutMs)
+      : undefined;
+
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(banner);
+      if (killer) clearTimeout(killer);
+      if (heartbeat) clearInterval(heartbeat);
+      resolve({ timedOut, exitCode: code });
+    };
+
+    child.on('exit', (code) => finish(code ?? 0));
+    child.on('error', () => finish(1));
+  });
 }
 
 function mkError(
@@ -115,7 +166,7 @@ function extractSlice(binary: string, arch: string, cacheDir: string, originalHa
   return slicePath;
 }
 
-export function run(opts: RunOptions): REResult {
+export async function run(opts: RunOptions): Promise<REResult> {
   const start = Date.now();
 
   if (!existsSync(opts.binary)) {
@@ -201,7 +252,14 @@ export function run(opts: RunOptions): REResult {
     const extraEnv = backend === 'ida' && opts.module
       ? { IDA_DYLD_CACHE_MODULE: opts.module }
       : undefined;
-    const { timedOut } = spawnTool(cmd, args, opts.timeout * 1000, extraEnv);
+
+    const sizeMb = (statSync(effectiveBinary).size / 1048576).toFixed(1);
+    const archTag = opts.arch ? ` ${opts.arch}` : '';
+    const moduleTag = opts.module ? `::${basename(opts.module)} ` : '';
+    const mode = (useIdb || useHop) ? 'reading cached database' : 'fresh analysis';
+    const label = `${backend} ${opts.command}: ${mode} of ${moduleTag}${basename(opts.binary)} (${sizeMb} MB${archTag})`;
+
+    const { timedOut } = await spawnTool(cmd, args, opts.timeout * 1000, logPath, label, extraEnv);
 
     if (timedOut) {
       keepTmp = true;

@@ -30,7 +30,7 @@ export const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 const DEFAULTS: Config = {
   tools: { idat64: '', hopper: '' },
   cache: { dir: '~/.cache/re-cli', resultTtl: 3600, maxSizeGb: 20, keepIdbs: true },
-  defaults: { backend: 'auto', timeout: 300 },
+  defaults: { backend: 'auto', timeout: 0 },  // 0 = no timeout; analysis runs to completion
   decompile: { backend: 'ida' },
 };
 
