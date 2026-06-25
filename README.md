@@ -96,7 +96,7 @@ Three layers keep repeat queries cheap:
 
 The first two live under the configured cache directory (default `~/.cache/re-cli`); manage caches with `re cache` and daemons with `re daemon`.
 
-The two backends are not feature-equivalent. IDA is the most complete (decompilation, strings, dyld shared caches). Hopper covers the common static queries but has API gaps it reports explicitly rather than silently faking — prefer IDA when a command is unsupported on Hopper.
+The two backends are not feature-equivalent. IDA is the most complete (decompilation, strings, dyld shared caches). Hopper covers the common static queries but has API gaps it reports explicitly rather than silently faking — prefer IDA when a command is unsupported on Hopper. See [docs/hopper.md](docs/hopper.md) for known Hopper issues and limitations.
 
 ## Performance & long-running analysis
 
