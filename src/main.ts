@@ -5,6 +5,8 @@ import { existsSync, readdirSync, readFileSync, statSync, rmSync } from 'node:fs
 import { join } from 'node:path';
 import { loadConfig, CONFIG_FILE } from './config.ts';
 import { run } from './runner.ts';
+import type { DaemonMode } from './runner.ts';
+import { listDaemons, stopAllDaemons, stopDaemonsForBinary } from './daemon.ts';
 import { expandHome, binaryHash, elapsed } from './util.ts';
 import { idbCacheDir, idbPath, resultPath } from './cache.ts';
 import {
@@ -154,6 +156,21 @@ function printPretty(r: REResult): void {
 
 // ─── Global flags → RunOptions fields ───────────────────────────────────────
 
+// --daemon is tri-state: auto (default) | on (force) | off (never). Accepts truthy/falsy
+// spellings too: bare `--daemon` → on, `--no-daemon`/`--daemon=false` → off.
+function daemonModeFromFlags(flags: Record<string, string | boolean>): DaemonMode {
+  const v = flags['daemon'];
+  if (v === undefined) return 'auto';
+  if (v === true) return 'on';
+  if (v === false) return 'off';
+  const s = String(v).toLowerCase();
+  if (['off', 'false', 'no', '0', 'disable', 'disabled'].includes(s)) return 'off';
+  if (['on', 'true', 'yes', '1', 'force', 'always'].includes(s)) return 'on';
+  if (s === 'auto') return 'auto';
+  process.stderr.write(`Invalid --daemon value: ${v} (use auto|on|off)\n`);
+  process.exit(1);
+}
+
 function globalRunOpts(flags: Record<string, string | boolean>, config: ReturnType<typeof loadConfig>) {
   return {
     backend: (flags['backend'] as 'auto' | BackendName | undefined) ?? 'auto',
@@ -161,17 +178,18 @@ function globalRunOpts(flags: Record<string, string | boolean>, config: ReturnTy
     noIdbCache: flags['idb-cache'] === false,
     timeout:    Number(flags['timeout']) || config.defaults.timeout,
     format:     String(flags['format'] ?? 'json'),
+    daemonMode: daemonModeFromFlags(flags),
     config,
   };
 }
 
 // ─── Cache subcommands ───────────────────────────────────────────────────────
 
-function cmdCache(
+async function cmdCache(
   args: string[],
   flags: Record<string, string | boolean>,
   config: ReturnType<typeof loadConfig>,
-): void {
+): Promise<void> {
   const [sub = 'list', ...rest] = args;
   const cacheDir = expandHome(config.cache.dir);
 
@@ -207,6 +225,8 @@ function cmdCache(
     }
     case 'clear': {
       if (flags['all']) {
+        // Stop daemons first — they hold the databases (and live in /tmp, outside cacheDir).
+        await stopAllDaemons(cacheDir);
         rmSync(cacheDir, { recursive: true, force: true });
         console.log(`Cleared: ${cacheDir}`);
       } else {
@@ -215,6 +235,7 @@ function cmdCache(
           process.stderr.write('Usage: re cache clear <binary>  (or --all to wipe everything)\n');
           process.exit(1);
         }
+        await stopDaemonsForBinary(cacheDir, binary);  // release the lock before deleting
         const hash = binaryHash(binary);
         const dir  = idbCacheDir(cacheDir, hash);
         if (existsSync(dir)) { rmSync(dir, { recursive: true, force: true }); console.log(`Cleared: ${dir}`); }
@@ -308,7 +329,7 @@ async function cmdDsc(
   }
   const module = resolveDscModule(dscPath, moduleSpec);
 
-  const { backend, noCache, noIdbCache, timeout, format } = globalRunOpts(flags, config);
+  const { backend, noCache, noIdbCache, timeout, format, daemonMode } = globalRunOpts(flags, config);
 
   if (backend === 'hopper') {
     throw new Error(
@@ -328,10 +349,78 @@ async function cmdDsc(
     noIdbCache,
     timeout,
     module,
+    daemonMode,
   });
 
   printResult(result, format);
   process.exit(result.status === 'ok' ? 0 : 1);
+}
+
+// ─── Daemon subcommand ───────────────────────────────────────────────────────
+
+async function cmdDaemon(
+  args: string[],
+  flags: Record<string, string | boolean>,
+  config: ReturnType<typeof loadConfig>,
+): Promise<void> {
+  const [sub = 'list', ...rest] = args;
+  const cacheDir = config.cache.dir;
+
+  switch (sub) {
+    case 'list':
+    case 'status': {
+      const list = await listDaemons(cacheDir);
+      if (!list.length) { console.log('(no daemons running)'); return; }
+      for (const d of list) {
+        const mins = Math.round((Date.now() - d.startedAt) / 60000);
+        const mod = d.module ? ` :: ${d.module}` : '';
+        const dot = d.alive ? '●' : '○';
+        console.log(`  ${dot} ${d.backend.padEnd(6)} pid ${String(d.pid).padEnd(7)} up ${mins}m  ${d.binaryPath}${mod}`);
+      }
+      return;
+    }
+    case 'stop': {
+      if (flags['all']) {
+        const n = await stopAllDaemons(cacheDir);
+        console.log(`Stopped ${n} daemon(s)`);
+        return;
+      }
+      const binary = rest[0];
+      if (!binary) {
+        process.stderr.write('Usage: re daemon stop <binary>  (or --all)\n');
+        process.exit(1);
+      }
+      const n = await stopDaemonsForBinary(cacheDir, binary);
+      console.log(n ? `Stopped ${n} daemon(s) for ${binary}` : '(no daemon running for that binary)');
+      return;
+    }
+    case 'start': {
+      const binary = rest[0];
+      if (!binary) {
+        process.stderr.write('Usage: re daemon start <binary> [--backend ida|hopper] [--arch ARCH]\n');
+        process.exit(1);
+      }
+      const { backend, timeout } = globalRunOpts(flags, config);
+      // Warm the daemon by forcing one through a cheap `info` query. noCache bypasses
+      // the result-cache fast-path so we actually reach the daemon (and start it).
+      const result = await run({
+        backend, command: 'info', binary, params: {}, config,
+        noCache: true, noIdbCache: false, timeout,
+        arch: flags['arch'] as string | undefined,
+        daemonMode: 'on',
+      });
+      if (result.status === 'ok') {
+        console.log(`Daemon ready for ${binary} (${result.backend}, warmed in ${result.durationSec}s). Idle timeout ${config.daemon.idleTimeout}s.`);
+      } else {
+        process.stderr.write(`Failed to start daemon: ${result.error?.message ?? 'unknown'}\n`);
+        process.exit(1);
+      }
+      return;
+    }
+    default:
+      process.stderr.write(`Unknown daemon subcommand: ${sub}\nUsage: re daemon <list|start|stop> ...\n`);
+      process.exit(1);
+  }
 }
 
 // ─── Help ────────────────────────────────────────────────────────────────────
@@ -363,6 +452,10 @@ Commands:
   cache path  <binary>
   cache info
 
+  daemon list                        Show running warm-database daemons
+  daemon start <binary>              Start (and warm) a daemon for a binary
+  daemon stop  <binary>   (or --all) Stop a daemon (frees its memory)
+
   dsc sims [<platform>]              List installed simulator runtimes
   dsc list                           List modules in the resolved DSC
   dsc <op> <module>                  Run any analysis op against a DSC module
@@ -381,7 +474,10 @@ Global flags:
                                      (for DSC: pick the matching DSC arch file)
   --timeout    seconds               Optional hard cap (default: none — runs to completion)
   --no-cache                         Skip result cache
-  --no-idb-cache                     Force re-analysis even if .i64 exists
+  --no-idb-cache                     Force re-analysis even if .i64 exists (forces one-shot)
+  --daemon     auto | on | off       Warm-database daemon (default: auto). auto starts one
+                                     for binaries >= daemon.autostartMinMb; on forces it;
+                                     off (or --no-daemon) always runs one-shot
   --format     json | pretty         (default: json)
 
 Config: ${CONFIG_FILE}
@@ -422,10 +518,15 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
-  const { backend, noCache, noIdbCache, timeout, format } = globalRunOpts(flags, config);
+  const { backend, noCache, noIdbCache, timeout, format, daemonMode } = globalRunOpts(flags, config);
 
   if (command === 'cache') {
-    cmdCache(positional, flags, config);
+    await cmdCache(positional, flags, config);
+    return;
+  }
+
+  if (command === 'daemon') {
+    await cmdDaemon(positional, flags, config);
     return;
   }
 
@@ -461,6 +562,7 @@ async function main(): Promise<void> {
     noIdbCache,
     timeout,
     arch: flags['arch'] as string | undefined,
+    daemonMode,
   });
 
   printResult(result, format);

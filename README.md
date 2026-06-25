@@ -34,7 +34,7 @@ ln -sf "$(pwd)/src/main.ts" ~/.local/bin/re   # ensure ~/.local/bin is on PATH
 re --help
 ```
 
-Backends are auto-detected from standard `/Applications` locations. Override detection with the `RE_IDAT64` / `RE_HOPPER` environment variables, or pin paths and defaults in `~/.config/re-cli/config.json` (timeouts, cache directory, default backend, result TTL).
+Backends are auto-detected from standard `/Applications` locations. Override detection with the `RE_IDAT64` / `RE_HOPPER` environment variables, or pin paths and defaults in `~/.config/re-cli/config.json` (timeouts, cache directory, default backend, result TTL, and a `daemon` block: `enabled`, `idleTimeout`, `autostartMinMb`).
 
 ## Usage
 
@@ -53,9 +53,10 @@ Run `re --help` for the authoritative, always-current list of commands and flags
 | `xrefs` | Cross-references `--to` / `--from` a name or address |
 | `strings` / `imports` / `exports` / `segments` | The usual static views |
 | `cache …` | Inspect and clear the analysis cache |
+| `daemon …` | Manage warm-database daemons (`start` / `stop` / `list`) |
 | `dsc …` | List and analyze modules inside a dyld shared cache (incl. simulator runtimes) |
 
-Common global flags: `--backend ida|hopper|auto`, `--arch arm64|x86_64` (thin a fat binary before analysis), `--format json|pretty`, `--timeout SECONDS`, `--no-cache`, `--no-idb-cache`.
+Common global flags: `--backend ida|hopper|auto`, `--arch arm64|x86_64` (thin a fat binary before analysis), `--format json|pretty`, `--timeout SECONDS`, `--no-cache`, `--no-idb-cache`, `--daemon auto|on|off`.
 
 ### Output contract
 
@@ -87,23 +88,39 @@ Treat stdout as data: it is exactly this envelope and nothing else. Human-readab
 3. Runs IDA/Hopper headless as a subprocess, pointed at the script.
 4. Reads the JSON the script writes to a temp file, wraps it in the envelope above, and caches it.
 
-Two layers of caching make repeat queries cheap:
+Three layers keep repeat queries cheap:
 
 - **Disassembler database cache** — the backend's analyzed database (e.g. IDA `.i64`) is saved keyed by a hash of the binary's path, mtime, and size. Reopening it skips re-analysis entirely. `--no-idb-cache` forces fresh analysis.
 - **Result cache** — each command's JSON result is memoized with a TTL. `--no-cache` bypasses it.
+- **Warm daemon** — for large binaries, a long-lived backend process keeps the database loaded in memory so distinct queries skip even the (multi-GB) reopen cost. See [Warm daemon](#warm-daemon). When a daemon serves a binary it execs the *same* composed scripts a one-shot run would — the only difference is the process stays alive between queries.
 
-Both live under the configured cache directory (default `~/.cache/re-cli`); manage them with `re cache`.
+The first two live under the configured cache directory (default `~/.cache/re-cli`); manage caches with `re cache` and daemons with `re daemon`.
 
 The two backends are not feature-equivalent. IDA is the most complete (decompilation, strings, dyld shared caches). Hopper covers the common static queries but has API gaps it reports explicitly rather than silently faking — prefer IDA when a command is unsupported on Hopper.
 
 ## Performance & long-running analysis
 
-First-time analysis of a large binary can take **many minutes** — a few tens of MB is small for a Mach-O, and real targets run far longer. This is the disassembler working, not a hang. Two things make that bearable:
+First-time analysis of a large binary can take **many minutes** — a few tens of MB is small for a Mach-O, and real targets run far longer. This is the disassembler working, not a hang. Three things make that bearable:
 
 - **No timeout by default.** A fresh analysis runs to completion rather than being cut off. `re` streams progress to stderr the whole time (elapsed seconds plus the tail of the backend's own log) so the run is observably alive; pass `--timeout SECONDS` only if you deliberately want a hard cap (then a run that exceeds it returns `status: "timeout"`).
-- **Caching.** Once analyzed, the same query returns in well under a second.
+- **Caching.** A repeated *identical* query is memoized and returns in well under a second.
+- **Warm daemon.** For large databases, even reusing the cached analysis means reopening a multi-GB database from disk on *every* invocation — so a sweep of distinct queries (an `xrefs` pass, a series of `decompile`s) pays that reload each time. The daemon loads the database once into a long-lived backend process and serves further queries against it in milliseconds.
 
-Because a first analysis can outlast a foreground shell/tool limit, run it detached when driving `re` programmatically and let it finish in the background; subsequent queries hit the cache and are instant.
+### Warm daemon
+
+By default (`--daemon auto`), the first query against a binary at or above `daemon.autostartMinMb` (default 10 MB) starts a background daemon that analyzes once and stays resident; subsequent distinct queries route to it and return near-instantly. The daemon self-shuts-down after `daemon.idleTimeout` seconds idle (default 1800 = 30 min), freeing its memory.
+
+```bash
+re xrefs Foo --to _objc_msgSend     # auto-starts a daemon, analyzes once
+re decompile Foo --function _login  # served warm, in ms
+re daemon list                      # show running daemons (backend, pid, uptime, binary)
+re daemon stop Foo                  # stop one (or --all); frees its RAM
+re daemon start Foo                 # explicitly warm one ahead of time
+```
+
+`--daemon` is tri-state: `auto` (default), `on` (force a daemon even for small binaries), `off` (always one-shot; also `--no-daemon`). `--no-idb-cache` forces a fresh one-shot analysis and never uses a daemon. Because a live daemon holds an exclusive lock on the database, a one-shot run against the same binary can't open it — so while a daemon is running, queries for that binary route through it regardless of `--daemon`/`--no-idb-cache` (stop it first if you truly want a cold run). Daemons are per binary **and** backend; both IDA and Hopper are supported.
+
+Because a first analysis can outlast a foreground shell/tool limit, run it detached when driving `re` programmatically and let it finish in the background; subsequent queries hit the cache or a warm daemon and are instant.
 
 ## Working on `re`
 

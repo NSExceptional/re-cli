@@ -22,6 +22,11 @@ export interface Config {
   decompile: {
     backend: 'ida' | 'hopper';
   };
+  daemon: {
+    enabled: boolean;        // master switch for the warm-process daemon
+    idleTimeout: number;     // seconds a daemon waits idle before self-shutdown
+    autostartMinMb: number;  // under --daemon=auto, only daemonize binaries >= this size
+  };
 }
 
 const CONFIG_DIR = join(homedir(), '.config', 're-cli');
@@ -32,6 +37,7 @@ const DEFAULTS: Config = {
   cache: { dir: '~/.cache/re-cli', resultTtl: 3600, maxSizeGb: 20, keepIdbs: true },
   defaults: { backend: 'auto', timeout: 0 },  // 0 = no timeout; analysis runs to completion
   decompile: { backend: 'ida' },
+  daemon: { enabled: true, idleTimeout: 1800, autostartMinMb: 10 },  // 1800s = 30 min
 };
 
 function which(name: string): string {
@@ -88,6 +94,7 @@ export function loadConfig(): Config {
     cache: { ...DEFAULTS.cache, ...raw.cache },
     defaults: { ...DEFAULTS.defaults, ...raw.defaults },
     decompile: { ...DEFAULTS.decompile, ...raw.decompile },
+    daemon: { ...DEFAULTS.daemon, ...raw.daemon },
   };
   return resolveTools(merged);
 }

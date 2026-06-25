@@ -31,6 +31,12 @@ def _re_write_error(exc_type, message, log_excerpt=None):
 
 
 def _re_exit(code=0):
+    # Inside a daemon process the per-query script still runs its
+    # `finally: _re_exit(0)` trailer — but exiting would kill the warm document.
+    # The daemon sets RE_DAEMON=1, so here we return instead and let the daemon
+    # loop continue serving requests. One-shot runs (no env) exit as before.
+    if _os_base.environ.get('RE_DAEMON'):
+        return
     # Force-quit the Hopper process. os._exit skips cleanup but is reliable
     # in headless/automated use where we don't care about GUI teardown.
     _os_base._exit(code)

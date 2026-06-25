@@ -16,6 +16,9 @@ import {
 } from './cache.ts';
 import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
+import { runOnDaemon, probeDaemon } from './daemon.ts';
+
+export type DaemonMode = 'auto' | 'on' | 'off';
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
 
@@ -30,6 +33,7 @@ export interface RunOptions {
   timeout: number;
   arch?: string;
   module?: string;  // when set, treat `binary` as a DSC and load this module from it
+  daemonMode?: DaemonMode;  // auto (default) | on (force) | off (never)
 }
 
 function resolveBackend(
@@ -166,6 +170,122 @@ function extractSlice(binary: string, arch: string, cacheDir: string, originalHa
   return slicePath;
 }
 
+// Decide whether this query should run through a warm daemon or a one-shot spawn.
+// `daemonAlive` is whether one is already serving this binary — if so we must route
+// through it (it holds an exclusive lock on the database, so a one-shot can't open it).
+function daemonDecision(
+  opts: RunOptions,
+  sizeMb: number,
+  daemonAlive: boolean,
+): { use: boolean; notice?: string } {
+  const mode = opts.daemonMode ?? 'auto';
+
+  if (daemonAlive) {
+    // The cached database is locked by the running daemon; only it can read it now.
+    // Routing through it returns identical (warm) results, so honor that over the
+    // flags that would otherwise force a one-shot.
+    if (mode === 'off') {
+      return { use: true, notice: '[re] a daemon is serving this binary; --daemon=off ignored (stop it with: re daemon stop <binary>)' };
+    }
+    if (opts.noIdbCache) {
+      return { use: true, notice: '[re] a daemon is serving this binary; --no-idb-cache ignored (stop it with: re daemon stop <binary>)' };
+    }
+    return { use: true };
+  }
+
+  // No daemon yet — decide whether to start one.
+  if (mode === 'off') return { use: false };
+  // A daemon implies a persisted/warm database; --no-idb-cache asks for fresh,
+  // non-persisted analysis, so the two are mutually exclusive — stay one-shot.
+  if (opts.noIdbCache) {
+    return {
+      use: false,
+      notice: mode === 'on'
+        ? '[re] --no-idb-cache forces fresh analysis; skipping daemon'
+        : undefined,
+    };
+  }
+  if (mode === 'on') return { use: true };  // force, overriding size gate + enabled
+  const cfg = opts.config.daemon;
+  if (!cfg.enabled) return { use: false };
+  if (sizeMb < cfg.autostartMinMb) return { use: false };
+  return { use: true };
+}
+
+// Turn the JSON a backend script wrote at `outputPath` into a REResult. Shared by the
+// one-shot and daemon paths. keepTmp signals the temp dir should be preserved for
+// post-mortem (missing/garbled output).
+function buildResultFromOutput(
+  opts: RunOptions,
+  binHash: string,
+  backend: BackendName,
+  start: number,
+  outputPath: string,
+  logPath: string,
+): { result: REResult; keepTmp: boolean } {
+  if (!existsSync(outputPath)) {
+    const logExcerpt = existsSync(logPath) ? readFileSync(logPath, 'utf8').slice(-3000) : undefined;
+    return {
+      result: mkError(opts, binHash, backend, elapsed(start), 'NoOutput',
+        'Script produced no output — check logExcerpt for details', logExcerpt),
+      keepTmp: true,
+    };
+  }
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(readFileSync(outputPath, 'utf8')) as Record<string, unknown>;
+  } catch (e) {
+    return {
+      result: mkError(opts, binHash, backend, elapsed(start), 'ParseError',
+        `Failed to parse script output: ${e}`),
+      keepTmp: true,
+    };
+  }
+  const result: REResult = {
+    status: (raw['status'] as REResult['status']) ?? 'ok',
+    command: opts.command,
+    binary: opts.binary,
+    binaryHash: binHash,
+    backend,
+    backendVersion: (raw['backendVersion'] as string | null) ?? null,
+    durationSec: elapsed(start),
+    cached: false,
+    data: raw['data'] ?? null,
+    error: (raw['error'] as REResult['error']) ?? null,
+  };
+  return { result, keepTmp: false };
+}
+
+// Memoize the result and, after a fresh IDA analysis, record idb-cache metadata.
+// Behavior matches the original one-shot path; reused by the daemon path.
+function finalizeCaching(
+  opts: RunOptions,
+  binHash: string,
+  backend: BackendName,
+  cacheKeyParams: Record<string, unknown>,
+  result: REResult,
+  useIdb: boolean,
+  effectiveBinary: string,
+  cacheDir: string,
+): void {
+  if (!opts.noCache && result.status === 'ok') {
+    saveResult(cacheDir, resultKey(binHash, opts.command, cacheKeyParams), result);
+  }
+  if (!useIdb && backend === 'ida') {
+    const idbDir = idbCacheDir(cacheDir, binHash, opts.module);
+    const idbFile = join(idbDir, 'binary.i64');
+    if (existsSync(idbFile)) {
+      const s = statSync(effectiveBinary);
+      writeFileSync(join(idbDir, 'meta.json'), JSON.stringify({
+        path: opts.binary,
+        mtimeMs: s.mtimeMs,
+        size: s.size,
+        ...(opts.module ? { module: opts.module } : {}),
+      }));
+    }
+  }
+}
+
 export async function run(opts: RunOptions): Promise<REResult> {
   const start = Date.now();
 
@@ -253,12 +373,52 @@ export async function run(opts: RunOptions): Promise<REResult> {
       ? { IDA_DYLD_CACHE_MODULE: opts.module }
       : undefined;
 
-    const sizeMb = (statSync(effectiveBinary).size / 1048576).toFixed(1);
+    const sizeMb = statSync(effectiveBinary).size / 1048576;
     const archTag = opts.arch ? ` ${opts.arch}` : '';
     const moduleTag = opts.module ? `::${basename(opts.module)} ` : '';
     const mode = (useIdb || useHop) ? 'reading cached database' : 'fresh analysis';
-    const label = `${backend} ${opts.command}: ${mode} of ${moduleTag}${basename(opts.binary)} (${sizeMb} MB${archTag})`;
+    const label = `${backend} ${opts.command}: ${mode} of ${moduleTag}${basename(opts.binary)} (${sizeMb.toFixed(1)} MB${archTag})`;
 
+    // ── Strategy: route through a warm daemon, or spawn a one-shot process ──
+    const daemonAlive = await probeDaemon(cacheDir, backend, binHash, opts.module);
+    const decision = daemonDecision(opts, sizeMb, daemonAlive);
+    if (decision.notice) process.stderr.write(decision.notice + '\n');
+
+    if (decision.use) {
+      const outputIdbPath = (backend === 'ida' && !useIdb)
+        ? join(ensureIdbDir(cacheDir, binHash, opts.module), 'binary.i64')
+        : undefined;
+      const outcome = await runOnDaemon({
+        cacheDir, backend, toolPath, binHash,
+        module: opts.module,
+        binaryPath: opts.binary,
+        effectiveBinary,
+        idbPath: backend === 'ida' && useIdb ? idbPath(cacheDir, binHash, opts.module) : undefined,
+        outputIdbPath,
+        hopPath: backend === 'hopper' && useHop ? hopPath(cacheDir, binHash, opts.module) : undefined,
+        idleTimeout: opts.config.daemon.idleTimeout,
+        timeoutMs: opts.timeout * 1000,
+        extraEnv,
+        label,
+      }, script);
+
+      if (outcome.status === 'served') {
+        const fin = buildResultFromOutput(opts, binHash, backend, start, outputPath, logPath);
+        keepTmp = fin.keepTmp;
+        if (!fin.keepTmp) {
+          finalizeCaching(opts, binHash, backend, cacheKeyParams, fin.result, useIdb, effectiveBinary, cacheDir);
+        }
+        return fin.result;
+      }
+      if (outcome.status === 'execError') {
+        keepTmp = true;
+        return mkError(opts, binHash, backend, elapsed(start), 'DaemonExecError', outcome.error);
+      }
+      // 'unavailable' → fall through to a one-shot spawn below.
+      process.stderr.write(`[re] daemon unavailable (${outcome.error}); running one-shot\n`);
+    }
+
+    // ── One-shot spawn (also the daemon fallback) ──
     const { timedOut } = await spawnTool(cmd, args, opts.timeout * 1000, logPath, label, extraEnv);
 
     if (timedOut) {
@@ -272,58 +432,12 @@ export async function run(opts: RunOptions): Promise<REResult> {
       };
     }
 
-    if (!existsSync(outputPath)) {
-      keepTmp = true;
-      const logExcerpt = existsSync(logPath)
-        ? readFileSync(logPath, 'utf8').slice(-3000)
-        : undefined;
-      return mkError(opts, binHash, backend, elapsed(start), 'NoOutput',
-        'Script produced no output — check logExcerpt for details', logExcerpt);
+    const fin = buildResultFromOutput(opts, binHash, backend, start, outputPath, logPath);
+    keepTmp = fin.keepTmp;
+    if (!fin.keepTmp) {
+      finalizeCaching(opts, binHash, backend, cacheKeyParams, fin.result, useIdb, effectiveBinary, cacheDir);
     }
-
-    let raw: Record<string, unknown>;
-    try {
-      raw = JSON.parse(readFileSync(outputPath, 'utf8')) as Record<string, unknown>;
-    } catch (e) {
-      keepTmp = true;
-      return mkError(opts, binHash, backend, elapsed(start), 'ParseError',
-        `Failed to parse script output: ${e}`);
-    }
-
-    const result: REResult = {
-      status: (raw['status'] as REResult['status']) ?? 'ok',
-      command: opts.command,
-      binary: opts.binary,
-      binaryHash: binHash,
-      backend,
-      backendVersion: (raw['backendVersion'] as string | null) ?? null,
-      durationSec: elapsed(start),
-      cached: false,
-      data: raw['data'] ?? null,
-      error: (raw['error'] as REResult['error']) ?? null,
-    };
-
-    if (!opts.noCache && result.status === 'ok') {
-      const rKey = resultKey(binHash, opts.command, cacheKeyParams);
-      saveResult(cacheDir, rKey, result);
-    }
-
-    // Save IDB cache metadata after a fresh analysis
-    if (!useIdb && backend === 'ida') {
-      const idbDir = idbCacheDir(cacheDir, binHash, opts.module);
-      const idbFile = join(idbDir, 'binary.i64');
-      if (existsSync(idbFile)) {
-        const s = statSync(effectiveBinary);
-        writeFileSync(join(idbDir, 'meta.json'), JSON.stringify({
-          path: opts.binary,
-          mtimeMs: s.mtimeMs,
-          size: s.size,
-          ...(opts.module ? { module: opts.module } : {}),
-        }));
-      }
-    }
-
-    return result;
+    return fin.result;
   } finally {
     if (!keepTmp) {
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
