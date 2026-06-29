@@ -18,6 +18,7 @@ import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
 import { runOnDaemon, probeDaemon, daemonKey } from './daemon.ts';
 import { tryAcquireAnalysisLock, waitForAnalysisLock, type AnalysisLock } from './lock.ts';
+import { startNarrator } from './progress.ts';
 
 export type DaemonMode = 'auto' | 'on' | 'off';
 
@@ -88,30 +89,13 @@ function spawnTool(
 ): Promise<{ timedOut: boolean; exitCode: number }> {
   return new Promise((resolve) => {
     const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
-    const start = Date.now();
     const child = spawn(cmd, args, { stdio: 'ignore', env });
 
     let timedOut = false;
     let settled = false;
-    let heartbeat: ReturnType<typeof setInterval> | undefined;
-
-    // Stay silent for the first few seconds so fast cache reloads make no noise;
-    // only narrate runs that are actually slow.
-    const banner = setTimeout(() => {
-      process.stderr.write(`[re] ${label} — working, this can take several minutes…\n`);
-      heartbeat = setInterval(() => {
-        const secs = Math.round((Date.now() - start) / 1000);
-        let tail = '';
-        try {
-          if (existsSync(logPath)) {
-            const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n');
-            const last = lines[lines.length - 1]?.trim().slice(0, 100);
-            if (last) tail = `  ${last}`;
-          }
-        } catch {}
-        process.stderr.write(`[re] …${secs}s elapsed${tail}\n`);
-      }, 10_000);
-    }, 3_000);
+    // Narrate progress to stderr (deduped, with a coarse phase) so the run is
+    // observably alive without spamming repeats. stdout stays the JSON result.
+    const stopNarrator = startNarrator(logPath, label);
 
     // A timeout is opt-in (--timeout N). With none, analysis runs to completion —
     // large binaries legitimately take many minutes, and the heartbeat above keeps
@@ -126,9 +110,8 @@ function spawnTool(
     const finish = (code: number) => {
       if (settled) return;
       settled = true;
-      clearTimeout(banner);
+      stopNarrator();
       if (killer) clearTimeout(killer);
-      if (heartbeat) clearInterval(heartbeat);
       resolve({ timedOut, exitCode: code });
     };
 

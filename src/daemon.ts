@@ -22,6 +22,7 @@ import type { BackendName } from './backends/types.ts';
 import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
 import { expandHome } from './util.ts';
+import { startNarrator } from './progress.ts';
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
 
@@ -166,29 +167,6 @@ function sendRequest(socketPath: string, req: object, timeoutMs: number): Promis
     // should not be cut off unless the user asked for a timeout.
     if (timeoutMs > 0) sock.setTimeout(timeoutMs, () => fail(new Error('daemon request timed out')));
   });
-}
-
-// ─── Progress narration (mirrors runner.spawnTool's heartbeat) ──────────────────
-
-function startNarrator(logPath: string, label: string): () => void {
-  const start = Date.now();
-  let heartbeat: ReturnType<typeof setInterval> | undefined;
-  const banner = setTimeout(() => {
-    process.stderr.write(`[re] ${label} — working, this can take several minutes…\n`);
-    heartbeat = setInterval(() => {
-      const secs = Math.round((Date.now() - start) / 1000);
-      let tail = '';
-      try {
-        if (existsSync(logPath)) {
-          const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n');
-          const last = lines[lines.length - 1]?.trim().slice(0, 100);
-          if (last) tail = `  ${last}`;
-        }
-      } catch {}
-      process.stderr.write(`[re] …${secs}s elapsed${tail}\n`);
-    }, 10_000);
-  }, 3_000);
-  return () => { clearTimeout(banner); if (heartbeat) clearInterval(heartbeat); };
 }
 
 // Poll until the daemon's socket is connectable (== ready, since it binds only after
