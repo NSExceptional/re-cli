@@ -16,7 +16,8 @@ import {
 } from './cache.ts';
 import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
-import { runOnDaemon, probeDaemon } from './daemon.ts';
+import { runOnDaemon, probeDaemon, daemonKey } from './daemon.ts';
+import { tryAcquireAnalysisLock, waitForAnalysisLock, type AnalysisLock } from './lock.ts';
 
 export type DaemonMode = 'auto' | 'on' | 'off';
 
@@ -322,7 +323,7 @@ export async function run(opts: RunOptions): Promise<REResult> {
       `${toolName} not found. Set RE_${toolName.toUpperCase()} env var or add to ~/.config/re-cli/config.json`);
   }
 
-  const useIdb = !opts.noIdbCache && backend === 'ida' && hasIdb(cacheDir, binHash, opts.module);
+  let useIdb = !opts.noIdbCache && backend === 'ida' && hasIdb(cacheDir, binHash, opts.module);
   const useHop = !opts.noIdbCache && backend === 'hopper' && hasHop(cacheDir, binHash, opts.module);
 
   const tmpDir = join(tmpdir(), `re_${randomId()}`);
@@ -419,25 +420,67 @@ export async function run(opts: RunOptions): Promise<REResult> {
     }
 
     // ── One-shot spawn (also the daemon fallback) ──
-    const { timedOut } = await spawnTool(cmd, args, opts.timeout * 1000, logPath, label, extraEnv);
-
-    if (timedOut) {
-      keepTmp = true;
-      return {
-        status: 'timeout',
-        command: opts.command, binary: opts.binary, binaryHash: binHash,
-        backend, backendVersion: null,
-        durationSec: elapsed(start), cached: false, data: null,
-        error: { type: 'Timeout', message: `Process did not complete within ${opts.timeout}s` },
-      };
+    // Guard concurrent fresh IDA analyses of the same binary: without a lock both
+    // would run `idat64 -A -c -o<same .i64>` and clobber each other. The daemon
+    // decision above already funnels big/auto runs through one daemon; this covers
+    // the one-shot cases it skips (--daemon=off, sub-gate sizes, --no-idb-cache).
+    let analysisLock: AnalysisLock | undefined;
+    if (backend === 'ida' && !useIdb) {
+      const lockKey = daemonKey(backend, binHash, opts.module);
+      let announced = false;
+      // Loop until we either hold the lock (our turn to analyze) or can reuse a
+      // database a holder just built. Looping (not a single wait) is required so
+      // that with 3+ contenders the losers of each round wait again rather than
+      // racing ahead unlocked.
+      while (true) {
+        const res = tryAcquireAnalysisLock(cacheDir, lockKey);
+        if (res.acquired) { analysisLock = res.lock; break; }
+        if (!announced) {
+          announced = true;
+          const waited = res.startedAt ? Math.round((Date.now() - res.startedAt) / 1000) : 0;
+          const detail = res.holderPid ? ` (pid ${res.holderPid}, ${waited}s in)` : '';
+          process.stderr.write(
+            `[re] another re process is already analyzing ${basename(opts.binary)}${detail}; waiting…\n`);
+        }
+        await waitForAnalysisLock(cacheDir, lockKey);
+        // Holder released: reuse the database it built rather than re-analyzing,
+        // unless the caller forced fresh analysis (--no-idb-cache).
+        if (!opts.noIdbCache && hasIdb(cacheDir, binHash, opts.module)) {
+          useIdb = true;
+          ({ cmd, args } = buildIdaCommand({
+            binaryPath: effectiveBinary,
+            idbPath: idbPath(cacheDir, binHash, opts.module),
+            scriptPath, logPath, module: opts.module,
+          }, toolPath));
+          process.stderr.write('[re] reusing the freshly built database (warm reload)\n');
+          break;
+        }
+      }
     }
 
-    const fin = buildResultFromOutput(opts, binHash, backend, start, outputPath, logPath);
-    keepTmp = fin.keepTmp;
-    if (!fin.keepTmp) {
-      finalizeCaching(opts, binHash, backend, cacheKeyParams, fin.result, useIdb, effectiveBinary, cacheDir);
+    try {
+      const { timedOut } = await spawnTool(cmd, args, opts.timeout * 1000, logPath, label, extraEnv);
+
+      if (timedOut) {
+        keepTmp = true;
+        return {
+          status: 'timeout',
+          command: opts.command, binary: opts.binary, binaryHash: binHash,
+          backend, backendVersion: null,
+          durationSec: elapsed(start), cached: false, data: null,
+          error: { type: 'Timeout', message: `Process did not complete within ${opts.timeout}s` },
+        };
+      }
+
+      const fin = buildResultFromOutput(opts, binHash, backend, start, outputPath, logPath);
+      keepTmp = fin.keepTmp;
+      if (!fin.keepTmp) {
+        finalizeCaching(opts, binHash, backend, cacheKeyParams, fin.result, useIdb, effectiveBinary, cacheDir);
+      }
+      return fin.result;
+    } finally {
+      analysisLock?.release();
     }
-    return fin.result;
   } finally {
     if (!keepTmp) {
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}

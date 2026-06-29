@@ -301,6 +301,12 @@ async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string,
   }
 
   // 3. Another process is starting it — wait for its socket, bailing if that starter dies.
+  const starterPid = (() => {
+    try { return Number(readFileSync(join(lockDir, 'pid'), 'utf8')); } catch { return 0; }
+  })();
+  if (starterPid) {
+    process.stderr.write(`[re] another re process is starting a daemon for this binary (pid ${starterPid}); waiting…\n`);
+  }
   const starterAlive = () => {
     try { return pidAlive(Number(readFileSync(join(lockDir, 'pid'), 'utf8'))); }
     catch { return existsSync(lockDir); }
