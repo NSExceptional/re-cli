@@ -1,8 +1,9 @@
 #!/usr/bin/env -S node --experimental-strip-types --no-warnings
 
 import process from 'node:process';
+import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { loadConfig, CONFIG_FILE } from './config.ts';
 import { run } from './runner.ts';
 import type { DaemonMode } from './runner.ts';
@@ -499,6 +500,94 @@ async function cmdStatus(
   process.exit(state === 'ready' ? 0 : state === 'warming' ? 3 : 4);
 }
 
+// ─── Analyze / wait subcommands ──────────────────────────────────────────────
+
+function sleepMs(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+
+// Resolve the effective hash a query would use; '' if --arch was requested but the
+// slice hasn't been extracted yet (so nothing is cached/serving for it).
+function effectiveHash(binary: string, arch: string | undefined, cacheDir: string): string {
+  const oh = binaryHash(binary);
+  if (!arch) return oh;
+  const slicePath = join(expandHome(cacheDir), 'slices', `${oh}-${arch}`);
+  return existsSync(slicePath) ? binaryHash(slicePath) : '';
+}
+
+// `re analyze <binary>` — kick off a warm daemon in the background and return at once,
+// so callers can `re analyze X &-style` then `re wait X`. Implemented by re-exec'ing
+// this CLI detached as a forced-daemon `info` query, which starts and warms the daemon.
+async function cmdAnalyze(
+  positional: string[],
+  flags: Record<string, string | boolean>,
+  _config: ReturnType<typeof loadConfig>,
+): Promise<void> {
+  const [binary] = positional;
+  if (!binary) { process.stderr.write('Usage: re analyze <binary> [--arch ARCH] [--backend ida|hopper]\n'); process.exit(1); }
+  if (!existsSync(binary)) { process.stderr.write(`Binary not found: ${binary}\n`); process.exit(4); }
+
+  const childArgs = ['info', binary, '--daemon', 'on', '--no-cache'];
+  if (flags['arch']) childArgs.push('--arch', String(flags['arch']));
+  if (flags['backend']) childArgs.push('--backend', String(flags['backend']));
+  const nodeFlags = process.execArgv.length ? process.execArgv : ['--experimental-strip-types', '--no-warnings'];
+  const child = spawn(process.execPath, [...nodeFlags, process.argv[1], ...childArgs], { detached: true, stdio: 'ignore' });
+  child.unref();
+
+  const archHint = flags['arch'] ? ` --arch ${flags['arch']}` : '';
+  process.stdout.write(JSON.stringify({
+    status: 'warming', binary, pid: child.pid ?? null,
+    message: `analysis started in the background; run 're wait ${binary}${archHint}' to block until ready`,
+  }) + '\n');
+}
+
+// `re wait <binary>` — block until an analysis is ready (cached .i64 or a warm daemon),
+// narrating elapsed time. Exit 0 ready; with --timeout, exit 3 (still warming) on expiry.
+async function cmdWait(
+  positional: string[],
+  flags: Record<string, string | boolean>,
+  config: ReturnType<typeof loadConfig>,
+): Promise<void> {
+  const [binary] = positional;
+  if (!binary) { process.stderr.write('Usage: re wait <binary> [--arch ARCH] [--timeout SEC]\n'); process.exit(1); }
+  if (!existsSync(binary)) { process.stderr.write(`Binary not found: ${binary}\n`); process.exit(4); }
+
+  const cacheDir = config.cache.dir;
+  const backend = statusBackend(flags, config);
+  const arch = flags['arch'] as string | undefined;
+  const timeoutMs = (Number(flags['timeout']) || 0) * 1000;
+  const format = String(flags['format'] ?? 'json');
+  const start = Date.now();
+
+  const ready = async (): Promise<boolean> => {
+    const bh = effectiveHash(binary, arch, cacheDir);
+    if (!bh) return false;
+    if (hasIdb(cacheDir, bh)) return true;
+    const d = await daemonFor(cacheDir, backend, bh);
+    return d != null && d.ready;
+  };
+
+  let lastBeat = 0;
+  for (;;) {
+    if (await ready()) {
+      const waitedSec = Math.round((Date.now() - start) / 1000);
+      if (format === 'pretty') console.log(`${binary} ready (${waitedSec}s)`);
+      else process.stdout.write(JSON.stringify({ status: 'ready', binary, waitedSec }) + '\n');
+      process.exit(0);
+    }
+    const elapsedMs = Date.now() - start;
+    if (timeoutMs && elapsedMs > timeoutMs) {
+      const waitedSec = Math.round(elapsedMs / 1000);
+      if (format === 'pretty') process.stderr.write(`${binary} still warming after ${waitedSec}s\n`);
+      else process.stdout.write(JSON.stringify({ status: 'warming', binary, waitedSec }) + '\n');
+      process.exit(3);
+    }
+    if (elapsedMs - lastBeat >= 5000) {
+      lastBeat = elapsedMs;
+      process.stderr.write(`[re] waiting for ${basename(binary)} to be ready… ${Math.round(elapsedMs / 1000)}s\n`);
+    }
+    await sleepMs(500);
+  }
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 const HELP = `\
@@ -534,6 +623,8 @@ Commands:
 
   status    <binary> [--arch ARCH]   Is analysis ready / warming / absent?
                                      (exit 0 ready, 3 warming, 4 none)
+  analyze   <binary> [--arch ARCH]   Start warming a daemon in the background, return now
+  wait      <binary> [--timeout SEC] Block until ready (exit 0; exit 3 if --timeout hit)
 
   dsc sims [<platform>]              List installed simulator runtimes
   dsc list                           List modules in the resolved DSC
@@ -611,6 +702,16 @@ async function main(): Promise<void> {
 
   if (command === 'status') {
     await cmdStatus(positional, flags, config);
+    return;
+  }
+
+  if (command === 'analyze') {
+    await cmdAnalyze(positional, flags, config);
+    return;
+  }
+
+  if (command === 'wait') {
+    await cmdWait(positional, flags, config);
     return;
   }
 
