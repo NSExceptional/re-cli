@@ -311,6 +311,20 @@ export async function probeDaemon(
   return canConnect(meta.socketPath);
 }
 
+// Status of the daemon for one binary (for `re status`): the process may be alive but
+// still warming (socket not yet bound) — distinguishable via `ready`.
+export async function daemonFor(
+  cacheDir: string,
+  backend: BackendName,
+  binHash: string,
+  module?: string,
+): Promise<{ pid: number; startedAt: number; ready: boolean } | null> {
+  const dir = registryDir(cacheDir, daemonKey(backend, binHash, module));
+  const meta = readMeta(dir);
+  if (!meta || !pidAlive(meta.pid)) return null;
+  return { pid: meta.pid, startedAt: meta.startedAt, ready: await canConnect(meta.socketPath) };
+}
+
 // ─── Public entry: run one query through a (possibly auto-started) daemon ────────
 
 export async function runOnDaemon(spec: DaemonRunSpec, scriptText: string): Promise<DaemonOutcome> {

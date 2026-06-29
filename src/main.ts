@@ -6,9 +6,10 @@ import { join } from 'node:path';
 import { loadConfig, CONFIG_FILE } from './config.ts';
 import { run } from './runner.ts';
 import type { DaemonMode } from './runner.ts';
-import { listDaemons, stopAllDaemons, stopDaemonsForBinary } from './daemon.ts';
+import { listDaemons, stopAllDaemons, stopDaemonsForBinary, daemonFor, daemonKey } from './daemon.ts';
+import { analysisLockHolder } from './lock.ts';
 import { expandHome, binaryHash, elapsed } from './util.ts';
-import { idbCacheDir, idbPath, resultPath } from './cache.ts';
+import { idbCacheDir, idbPath, resultPath, hasIdb } from './cache.ts';
 import {
   resolveDscPath, listDscModules, resolveDscModule,
   listSimRuntimes, formatSimsByPlatform, formatSimsForPlatform,
@@ -20,7 +21,7 @@ import type { REResult, BackendName } from './result.ts';
 // ─── Arg parsing ────────────────────────────────────────────────────────────
 
 const VALUE_FLAGS = new Set([
-  'backend', 'timeout', 'format', 'arch', 'sim', 'dsc',
+  'backend', 'timeout', 'format', 'arch', 'sim', 'dsc', 'daemon',
   'function', 'address', 'count', 'filter', 'type',
   'min-length', 'to', 'from', 'library', 'range',
 ]);
@@ -423,6 +424,81 @@ async function cmdDaemon(
   }
 }
 
+// ─── Status subcommand ───────────────────────────────────────────────────────
+
+function statusBackend(flags: Record<string, string | boolean>, config: ReturnType<typeof loadConfig>): BackendName {
+  const req = flags['backend'];
+  if (req === 'ida' || req === 'hopper') return req;
+  if (config.defaults.backend !== 'auto') return config.defaults.backend;
+  return 'ida';
+}
+
+// `re status <binary>` — report whether an analysis is ready, warming, or absent,
+// by introspecting the three sources of truth: the daemon registry, the one-shot
+// analysis lock, and the on-disk idb. No analysis is started.
+async function cmdStatus(
+  positional: string[],
+  flags: Record<string, string | boolean>,
+  config: ReturnType<typeof loadConfig>,
+): Promise<void> {
+  const [binary] = positional;
+  const format = String(flags['format'] ?? 'json');
+  if (!binary) { process.stderr.write('Usage: re status <binary> [--arch ARCH] [--backend ida|hopper]\n'); process.exit(1); }
+  if (!existsSync(binary)) { process.stderr.write(`Binary not found: ${binary}\n`); process.exit(4); }
+
+  const cacheDir = config.cache.dir;
+  const backend = statusBackend(flags, config);
+  const arch = flags['arch'] as string | undefined;
+
+  // Resolve the effective hash the run path would use. With --arch, that's the hash of
+  // the extracted slice; if it was never extracted, nothing is cached for that arch.
+  const originalHash = binaryHash(binary);
+  let binHash = originalHash;
+  if (arch) {
+    const slicePath = join(expandHome(cacheDir), 'slices', `${originalHash}-${arch}`);
+    binHash = existsSync(slicePath) ? binaryHash(slicePath) : '';
+  }
+
+  const daemon = binHash ? await daemonFor(cacheDir, backend, binHash) : null;
+  const holder = binHash ? analysisLockHolder(cacheDir, daemonKey(backend, binHash)) : null;
+  const idbExists = binHash ? hasIdb(cacheDir, binHash) : false;
+
+  let database: Record<string, unknown> = { exists: false };
+  if (idbExists) {
+    const p = idbPath(cacheDir, binHash);
+    const s = statSync(p);
+    database = { exists: true, path: p, sizeMb: +(s.size / 1048576).toFixed(1), mtime: new Date(s.mtimeMs).toISOString() };
+  }
+
+  const warming = (daemon != null && !daemon.ready) || holder != null;
+  const ready = (daemon != null && daemon.ready) || idbExists;
+  const state = ready ? 'ready' : warming ? 'warming' : 'none';
+  const now = Date.now();
+
+  const data = {
+    binary, arch: arch ?? null, backend, binaryHash: binHash || null, state,
+    daemon: daemon
+      ? { running: true, ready: daemon.ready, pid: daemon.pid, uptimeSec: Math.round((now - daemon.startedAt) / 1000) }
+      : { running: false },
+    analysis: holder
+      ? { inFlight: true, pid: holder.pid || null, elapsedSec: holder.startedAt ? Math.round((now - holder.startedAt) / 1000) : null }
+      : { inFlight: false },
+    database,
+  };
+
+  if (format === 'pretty') {
+    console.log(`${binary}${arch ? ` (${arch})` : ''} — ${state.toUpperCase()}`);
+    if (data.daemon.running) console.log(`  daemon     pid ${daemon!.pid}, up ${data.daemon.uptimeSec}s${daemon!.ready ? '' : ' (warming)'}`);
+    if (holder) console.log(`  analyzing  pid ${holder.pid || '?'}, ${data.analysis.elapsedSec ?? '?'}s elapsed`);
+    if (idbExists) console.log(`  database   ${database.sizeMb} MB, built ${database.mtime}`);
+    if (state === 'none') console.log('  (no daemon, no analysis in flight, no cached database)');
+  } else {
+    process.stdout.write(JSON.stringify(data) + '\n');
+  }
+  // Exit code lets scripts branch without parsing: ready=0, warming=3, none=4.
+  process.exit(state === 'ready' ? 0 : state === 'warming' ? 3 : 4);
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 const HELP = `\
@@ -455,6 +531,9 @@ Commands:
   daemon list                        Show running warm-database daemons
   daemon start <binary>              Start (and warm) a daemon for a binary
   daemon stop  <binary>   (or --all) Stop a daemon (frees its memory)
+
+  status    <binary> [--arch ARCH]   Is analysis ready / warming / absent?
+                                     (exit 0 ready, 3 warming, 4 none)
 
   dsc sims [<platform>]              List installed simulator runtimes
   dsc list                           List modules in the resolved DSC
@@ -527,6 +606,11 @@ async function main(): Promise<void> {
 
   if (command === 'daemon') {
     await cmdDaemon(positional, flags, config);
+    return;
+  }
+
+  if (command === 'status') {
+    await cmdStatus(positional, flags, config);
     return;
   }
 

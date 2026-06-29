@@ -69,6 +69,20 @@ export function tryAcquireAnalysisLock(cacheDir: string, key: string): Held | Co
   };
 }
 
+// Who, if anyone, currently holds the analysis lock for this key (for `re status`).
+// Returns null if free or held only by a dead process.
+export function analysisLockHolder(cacheDir: string, key: string): { pid: number; startedAt: number } | null {
+  const dir = lockDir(cacheDir, key);
+  if (!existsSync(dir)) return null;
+  try {
+    const m = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as { pid: number; startedAt: number };
+    if (m.pid && !pidAlive(m.pid)) return null;
+    return { pid: m.pid, startedAt: m.startedAt };
+  } catch {
+    return { pid: 0, startedAt: 0 };  // lock dir exists but meta not yet written
+  }
+}
+
 // Block until the current holder releases the lock or dies. Polls cheaply.
 export async function waitForAnalysisLock(cacheDir: string, key: string): Promise<void> {
   const dir = lockDir(cacheDir, key);
