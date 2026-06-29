@@ -52,8 +52,9 @@ Run `re --help` for the authoritative, always-current list of commands and flags
 | `disasm` | Disassembly for a function or address (`--count N`) |
 | `xrefs` | Cross-references `--to` / `--from` a name or address |
 | `strings` / `imports` / `exports` / `segments` | The usual static views |
-| `cache …` | Inspect and clear the analysis cache |
+| `cache …` | Inspect (`list`/`du`), prune (`gc`), and clear the analysis cache |
 | `daemon …` | Manage warm-database daemons (`start` / `stop` / `list`) |
+| `status` / `analyze` / `wait` | Check readiness (ready/warming/none) · kick off a background warm-up · block until ready |
 | `dsc …` | List and analyze modules inside a dyld shared cache (incl. simulator runtimes) |
 
 Common global flags: `--backend ida|hopper|auto`, `--arch arm64|x86_64` (thin a fat binary before analysis), `--format json|pretty`, `--timeout SECONDS`, `--no-cache`, `--no-idb-cache`, `--daemon auto|on|off`.
@@ -120,7 +121,15 @@ re daemon start Foo                 # explicitly warm one ahead of time
 
 `--daemon` is tri-state: `auto` (default), `on` (force a daemon even for small binaries), `off` (always one-shot; also `--no-daemon`). `--no-idb-cache` forces a fresh one-shot analysis and never uses a daemon. Because a live daemon holds an exclusive lock on the database, a one-shot run against the same binary can't open it — so while a daemon is running, queries for that binary route through it regardless of `--daemon`/`--no-idb-cache` (stop it first if you truly want a cold run). Daemons are per binary **and** backend; both IDA and Hopper are supported.
 
-Because a first analysis can outlast a foreground shell/tool limit, run it detached when driving `re` programmatically and let it finish in the background; subsequent queries hit the cache or a warm daemon and are instant.
+Because a first analysis can outlast a foreground shell/tool limit, kick it off in the background and poll rather than blocking a single call:
+
+```bash
+re analyze Foo --arch arm64    # start warming a daemon in the background, returns immediately
+re status  Foo --arch arm64    # ready / warming / none  (exit 0 / 3 / 4 — scriptable)
+re wait    Foo --arch arm64 --timeout 600   # block until ready (exit 3 if still warming at the cap)
+```
+
+After that, subsequent queries hit the cache or the warm daemon and return instantly. Concurrent invocations are safe: a second analysis of the same binary waits for the first instead of racing it (you'll see a `waiting…` notice on stderr), and reuses the database it produces.
 
 ## Working on `re`
 
