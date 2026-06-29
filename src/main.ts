@@ -25,6 +25,7 @@ const VALUE_FLAGS = new Set([
   'backend', 'timeout', 'format', 'arch', 'sim', 'dsc', 'daemon',
   'function', 'address', 'count', 'filter', 'type',
   'min-length', 'to', 'from', 'library', 'range',
+  'older-than', 'max-size',
 ]);
 
 interface ParsedArgs {
@@ -197,6 +198,60 @@ function globalRunOpts(flags: Record<string, string | boolean>, config: ReturnTy
 
 // ─── Cache subcommands ───────────────────────────────────────────────────────
 
+function dirSize(p: string): number {
+  let total = 0;
+  const walk = (d: string) => {
+    let entries: string[];
+    try { entries = readdirSync(d); } catch { return; }
+    for (const e of entries) {
+      const fp = join(d, e);
+      let st;
+      try { st = statSync(fp); } catch { continue; }
+      if (st.isDirectory()) walk(fp); else total += st.size;
+    }
+  };
+  let top;
+  try { top = statSync(p); } catch { return 0; }
+  if (top.isDirectory()) walk(p); else total = top.size;
+  return total;
+}
+
+const fmtMB = (bytes: number): string => (bytes / 1048576).toFixed(1) + ' MB';
+
+// Middle-truncate long paths (DSC module paths especially) so list/du stay columnar.
+function truncPath(p: string, max = 64): string {
+  if (p.length <= max) return p;
+  const keep = max - 1, head = Math.ceil(keep * 0.4), tail = keep - head;
+  return p.slice(0, head) + '…' + p.slice(p.length - tail);
+}
+
+interface IdbEntry { dir: string; label: string; path: string; module?: string; sizeBytes: number; mtimeMs: number; meta: Record<string, unknown>; }
+
+// Enumerate cached IDB databases (flat standalone + nested DSC-module layouts).
+function walkIdbEntries(cacheDir: string): IdbEntry[] {
+  const idbDir = join(cacheDir, 'idb');
+  const out: IdbEntry[] = [];
+  if (!existsSync(idbDir)) return out;
+  const add = (dir: string, label: string) => {
+    const idb = join(dir, 'binary.i64');
+    if (!existsSync(idb)) return;
+    let meta: Record<string, unknown> = {};
+    try { meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')); } catch {}
+    out.push({
+      dir, label, path: String(meta.path ?? '(unknown)'),
+      module: meta.module as string | undefined,
+      sizeBytes: dirSize(dir), mtimeMs: statSync(idb).mtimeMs, meta,
+    });
+  };
+  for (const hash of readdirSync(idbDir)) {
+    const hashDir = join(idbDir, hash);
+    try { if (!statSync(hashDir).isDirectory()) continue; } catch { continue; }
+    if (existsSync(join(hashDir, 'binary.i64'))) add(hashDir, hash);
+    else for (const mod of readdirSync(hashDir)) add(join(hashDir, mod), `${hash}/${mod}`);
+  }
+  return out;
+}
+
 async function cmdCache(
   args: string[],
   flags: Record<string, string | boolean>,
@@ -218,7 +273,7 @@ async function cmdCache(
           : { path: '(unknown)' };
         const size = (statSync(idb).size / 1048576).toFixed(1) + ' MB';
         const tag = meta.module ? ` :: ${meta.module}` : '';
-        console.log(`  ${label}  ${meta.path}${tag}  (${size})`);
+        console.log(`  ${label}  ${truncPath(meta.path)}${tag}  (${size})`);
       };
       for (const hash of readdirSync(idbDir)) {
         const hashDir = join(idbDir, hash);
@@ -257,9 +312,19 @@ async function cmdCache(
     }
     case 'path': {
       const binary = rest[0];
-      if (!binary) { process.stderr.write('Usage: re cache path <binary>\n'); process.exit(1); }
-      const hash = binaryHash(binary);
-      console.log(idbCacheDir(cacheDir, hash));
+      if (!binary) { process.stderr.write('Usage: re cache path <binary> [--arch ARCH]\n'); process.exit(1); }
+      const arch = flags['arch'] as string | undefined;
+      const hash = arch ? effectiveHash(binary, arch, cacheDir) : binaryHash(binary);
+      if (!hash) { console.log(`(no ${arch} slice extracted for that binary yet)`); break; }
+      const dir = idbCacheDir(cacheDir, hash);
+      console.log(dir);
+      const idb = join(dir, 'binary.i64');
+      if (existsSync(idb)) {
+        const s = statSync(idb);
+        console.log(`  ${fmtMB(s.size)}  built ${new Date(s.mtimeMs).toISOString()}`);
+      } else {
+        console.log('  (no database cached yet)');
+      }
       break;
     }
     case 'info': {
@@ -270,6 +335,71 @@ async function cmdCache(
         const count = readdirSync(d).length;
         console.log(`  ${sub.padEnd(10)} ${count} entries`);
       });
+      break;
+    }
+    case 'du': {
+      const entries = walkIdbEntries(cacheDir).sort((a, b) => b.sizeBytes - a.sizeBytes);
+      let idbTotal = 0;
+      for (const e of entries) {
+        idbTotal += e.sizeBytes;
+        const mod = e.module ? ` :: ${e.module}` : '';
+        console.log(`  ${fmtMB(e.sizeBytes).padStart(10)}  ${truncPath(e.path)}${mod}`);
+      }
+      const catSize = (name: string) => { const d = join(cacheDir, name); return existsSync(d) ? dirSize(d) : 0; };
+      const hop = catSize('hop'), slices = catSize('slices'), results = catSize('results');
+      console.log('  ' + '─'.repeat(46));
+      console.log(`  ${fmtMB(idbTotal).padStart(10)}  idb (${entries.length} database${entries.length === 1 ? '' : 's'})`);
+      if (hop) console.log(`  ${fmtMB(hop).padStart(10)}  hop`);
+      if (slices) console.log(`  ${fmtMB(slices).padStart(10)}  slices`);
+      if (results) console.log(`  ${fmtMB(results).padStart(10)}  results`);
+      console.log(`  ${fmtMB(idbTotal + hop + slices + results).padStart(10)}  TOTAL`);
+      break;
+    }
+    case 'gc': {
+      const entries = walkIdbEntries(cacheDir);
+      const toRemove: IdbEntry[] = [];
+      if (flags['stale']) {
+        // Stale = the source binary is gone, or a newer database exists for the same
+        // source (re-analysis after the binary changed leaves the old hash orphaned).
+        // We can't reliably compare mtime/size here because a sliced (--arch) entry
+        // records the slice's stat under the original path — so use supersession.
+        const byPath = new Map<string, IdbEntry[]>();
+        for (const e of entries) {
+          if (!byPath.has(e.path)) byPath.set(e.path, []);
+          byPath.get(e.path)!.push(e);
+        }
+        for (const e of entries) {
+          if (e.path === '(unknown)') continue;
+          if (!existsSync(e.path)) { toRemove.push(e); continue; }
+          const group = byPath.get(e.path)!;
+          if (group.length > 1) {
+            const newest = group.reduce((a, b) => (a.mtimeMs >= b.mtimeMs ? a : b));
+            if (e !== newest) toRemove.push(e);
+          }
+        }
+      } else if (flags['older-than'] !== undefined) {
+        const cutoff = Date.now() - Number(flags['older-than']) * 86_400_000;
+        for (const e of entries) if (e.mtimeMs < cutoff) toRemove.push(e);
+      } else if (flags['max-size'] !== undefined) {
+        const limit = Number(flags['max-size']) * 1_073_741_824;
+        let total = entries.reduce((s, e) => s + e.sizeBytes, 0);
+        for (const e of [...entries].sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+          if (total <= limit) break;
+          toRemove.push(e); total -= e.sizeBytes;
+        }
+      } else {
+        process.stderr.write('Usage: re cache gc --stale | --older-than DAYS | --max-size GB\n');
+        process.exit(1);
+      }
+      if (!toRemove.length) { console.log('(nothing to remove)'); break; }
+      let freed = 0;
+      for (const e of toRemove) {
+        await stopDaemonsForBinary(cacheDir, e.path);  // release any daemon holding it
+        rmSync(e.dir, { recursive: true, force: true });
+        freed += e.sizeBytes;
+        console.log(`  removed  ${truncPath(e.path)}  (${fmtMB(e.sizeBytes)})`);
+      }
+      console.log(`Freed ${fmtMB(freed)} from ${toRemove.length} database${toRemove.length === 1 ? '' : 's'}`);
       break;
     }
     default:
@@ -624,8 +754,10 @@ Commands:
 
   cache list
   cache clear <binary>   (or --all)
-  cache path  <binary>
+  cache path  <binary>               Cache dir + database size/mtime
   cache info
+  cache du                           Disk usage per database + totals
+  cache gc --stale | --older-than DAYS | --max-size GB   Prune cached databases
 
   daemon list                        Show running warm-database daemons
   daemon start <binary>              Start (and warm) a daemon for a binary
