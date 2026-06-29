@@ -79,6 +79,10 @@ function printPretty(r: REResult): void {
 
   if (r.status === 'error' || r.status === 'timeout') {
     process.stderr.write(`Error: ${r.error?.message ?? 'unknown'}\n`);
+    if (r.error?.suggestions?.length) {
+      process.stderr.write('Did you mean:\n');
+      for (const s of r.error.suggestions) process.stderr.write(`  ${s}\n`);
+    }
     if (r.error?.logExcerpt) process.stderr.write(r.error.logExcerpt + '\n');
     return;
   }
@@ -173,13 +177,19 @@ function daemonModeFromFlags(flags: Record<string, string | boolean>): DaemonMod
   process.exit(1);
 }
 
+// Default to human-readable output at a terminal, machine-readable JSON when piped or
+// redirected (incl. when an agent captures the output). --format always overrides.
+function defaultFormat(flags: Record<string, string | boolean>): string {
+  return String(flags['format'] ?? (process.stdout.isTTY ? 'pretty' : 'json'));
+}
+
 function globalRunOpts(flags: Record<string, string | boolean>, config: ReturnType<typeof loadConfig>) {
   return {
     backend: (flags['backend'] as 'auto' | BackendName | undefined) ?? 'auto',
     noCache:    flags['cache']    === false,
     noIdbCache: flags['idb-cache'] === false,
     timeout:    Number(flags['timeout']) || config.defaults.timeout,
-    format:     String(flags['format'] ?? 'json'),
+    format:     defaultFormat(flags),
     daemonMode: daemonModeFromFlags(flags),
     config,
   };
@@ -443,7 +453,7 @@ async function cmdStatus(
   config: ReturnType<typeof loadConfig>,
 ): Promise<void> {
   const [binary] = positional;
-  const format = String(flags['format'] ?? 'json');
+  const format = defaultFormat(flags);
   if (!binary) { process.stderr.write('Usage: re status <binary> [--arch ARCH] [--backend ida|hopper]\n'); process.exit(1); }
   if (!existsSync(binary)) { process.stderr.write(`Binary not found: ${binary}\n`); process.exit(4); }
 
@@ -554,7 +564,7 @@ async function cmdWait(
   const backend = statusBackend(flags, config);
   const arch = flags['arch'] as string | undefined;
   const timeoutMs = (Number(flags['timeout']) || 0) * 1000;
-  const format = String(flags['format'] ?? 'json');
+  const format = defaultFormat(flags);
   const start = Date.now();
 
   const ready = async (): Promise<boolean> => {

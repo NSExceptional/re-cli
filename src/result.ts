@@ -5,6 +5,7 @@ export interface REError {
   type: string;
   message: string;
   logExcerpt?: string;
+  suggestions?: string[];
 }
 
 export interface REResult<T = unknown> {

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync, statSync, readdirSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -270,14 +270,51 @@ function finalizeCaching(
   }
 }
 
+// On a missing path, glob nearby for the binary the caller probably meant — app
+// bundles in particular hide the executable a couple directories down (e.g.
+// `TikTok/TikTok.app/TikTok` → `…/TikTok.decrypted/TikTok`).
+function suggestBinaries(target: string): string[] {
+  const out = new Set<string>();
+  const dir = dirname(target);
+  const base = basename(target).toLowerCase();
+  const ls = (d: string): string[] => { try { return readdirSync(d); } catch { return []; } };
+
+  // Siblings whose name relates to the requested basename.
+  for (const e of ls(dir)) {
+    const el = e.toLowerCase();
+    if (el.includes(base) || base.includes(el)) out.add(join(dir, e));
+  }
+  // Direct guesses for the common app-bundle / decrypted layouts.
+  for (const c of [
+    join(`${target}.app`, 'Contents', 'MacOS', basename(target)),
+    join(dir, `${basename(target)}.app`, 'Contents', 'MacOS', basename(target)),
+    `${target}.decrypted`,
+    join(dir, `${basename(target)}.decrypted`, basename(target)),
+  ]) {
+    if (existsSync(c)) out.add(c);
+  }
+  // Executables inside any sibling *.app bundle.
+  for (const e of ls(dir)) {
+    if (!e.endsWith('.app')) continue;
+    const macos = join(dir, e, 'Contents', 'MacOS');
+    for (const m of ls(macos)) out.add(join(macos, m));
+  }
+  return [...out].filter((p) => p !== target).slice(0, 5);
+}
+
 export async function run(opts: RunOptions): Promise<REResult> {
   const start = Date.now();
 
   if (!existsSync(opts.binary)) {
+    const suggestions = suggestBinaries(opts.binary);
     return {
       status: 'error', command: opts.command, binary: opts.binary, binaryHash: '',
       backend: null, backendVersion: null, durationSec: 0, cached: false, data: null,
-      error: { type: 'FileNotFound', message: `Binary not found: ${opts.binary}` },
+      error: {
+        type: 'FileNotFound',
+        message: `Binary not found: ${opts.binary}`,
+        ...(suggestions.length ? { suggestions } : {}),
+      },
     };
   }
 
