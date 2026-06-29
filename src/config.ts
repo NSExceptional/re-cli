@@ -96,6 +96,12 @@ export function loadConfig(): Config {
     decompile: { ...DEFAULTS.decompile, ...raw.decompile },
     daemon: { ...DEFAULTS.daemon, ...raw.daemon },
   };
+  // On first run, drop a default config at the advertised path so it actually exists
+  // and the tunables (timeouts, daemon gate, cache) are discoverable. Tool paths are
+  // left empty so they stay auto-detected rather than pinned to today's install.
+  if (!existsSync(CONFIG_FILE)) {
+    try { saveConfig(merged); } catch {}
+  }
   return resolveTools(merged);
 }
 
