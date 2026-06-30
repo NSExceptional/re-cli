@@ -65,6 +65,7 @@ export interface DaemonRunSpec {
   hopPath?: string;         // cached .hop to open (Hopper fast-path)
   idleTimeout: number;      // seconds
   timeoutMs: number;        // startup/request cap; 0 = none
+  force?: boolean;          // allow a fresh analysis to overwrite an existing .i64 at outputIdbPath
   extraEnv?: Record<string, string>;
   label: string;            // progress-narration label
 }
@@ -397,6 +398,14 @@ async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string,
 
   if (haveLock) {
     try {
+      // Destructive-overwrite guard (defense in depth): a fresh daemon analysis writes a NEW
+      // .i64 to outputIdbPath via `-c -o`, destroying any database already there. Refuse unless
+      // forced. (Cold binaries have no .i64 here, so this only fires on the dangerous case.)
+      if (spec.outputIdbPath && !spec.force && existsSync(spec.outputIdbPath)) {
+        return { ok: false, error:
+          `refusing to overwrite the existing analysis at ${spec.outputIdbPath}: a fresh analysis ` +
+          `would destroy it. Pass --force to re-analyze, or 're cache clear' to discard it first.` };
+      }
       try { writeFileSync(join(lockDir, 'pid'), String(process.pid)); } catch {}
       const pid = spawnDaemon(spec, key, socketPath, logPath);
       // Register immediately (Phase 3): the socket now binds mid-analysis, so we may return

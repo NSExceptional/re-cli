@@ -15,7 +15,7 @@ import { spawnSync } from 'node:child_process';
 import process from 'node:process';
 import type { Config } from './config.ts';
 import type { BackendName } from './result.ts';
-import { binaryHash, expandHome, elapsed } from './util.ts';
+import { binaryHash, expandHome, elapsed, machoArchs } from './util.ts';
 import { hasIdb, idbPath, ensureIdbDir } from './cache.ts';
 import {
   runStreamOnDaemon, type DaemonRunSpec, type StreamFrame, type StreamExecHandle,
@@ -40,6 +40,7 @@ export interface StreamRunOptions {
   config: Config;
   backend: 'auto' | 'ida' | 'hopper';
   timeout: number;  // seconds; 0 = none
+  force?: boolean;  // allow a fresh analysis to overwrite an existing cached .i64
 }
 
 // Options that tune one streaming-script invocation (issue #13 phase 2):
@@ -185,6 +186,7 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     outputIdbPath,
     idleTimeout: opts.config.daemon.idleTimeout,
     timeoutMs: opts.timeout * 1000,
+    force: opts.force,
     label,
   };
 
@@ -656,6 +658,14 @@ function resolveBackendName(requested: 'auto' | BackendName, config: Config): Ba
 
 // Duplicated from runner.ts (kept local to avoid widening runner's export surface).
 function extractSlice(binary: string, arch: string, cacheDir: string, originalHash: string): string {
+  // Thin binary → nothing to slice; --arch is a no-op. Return the whole binary so the cache key
+  // matches `re status`/`re wait --arch` (which also fall back to the whole-binary hash).
+  const archs = machoArchs(binary);
+  if (archs.length <= 1) {
+    process.stderr.write(
+      `[re] ${basename(binary)} is a thin ${archs[0] ?? arch} binary; --arch ${arch} ignored (slicing only applies to fat binaries)\n`);
+    return binary;
+  }
   const sliceDir = join(expandHome(cacheDir), 'slices');
   mkdirSync(sliceDir, { recursive: true });
   const slicePath = join(sliceDir, `${originalHash}-${arch}`);

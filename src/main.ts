@@ -10,7 +10,7 @@ import type { DaemonMode } from './runner.ts';
 import { listDaemons, stopAllDaemons, stopDaemonsForBinary, daemonFor, daemonStarting, daemonStreamStats, daemonKey } from './daemon.ts';
 import { analysisLockHolder } from './lock.ts';
 import { phaseFromLog } from './progress.ts';
-import { expandHome, binaryHash, elapsed } from './util.ts';
+import { expandHome, binaryHash, elapsed, machoArchs } from './util.ts';
 import { idbCacheDir, idbPath, resultPath, hasIdb } from './cache.ts';
 import {
   resolveDscPath, listDscModules, resolveDscModule,
@@ -51,6 +51,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       positional.push(...argv.slice(i + 1));
       break;
     }
+    if (arg === '-f') { flags['force'] = true; continue; }  // -f / --force: allow destructive overwrite
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
       const eq = key.indexOf('=');
@@ -196,6 +197,7 @@ function globalRunOpts(flags: Record<string, string | boolean>, config: ReturnTy
     backend: (flags['backend'] as 'auto' | BackendName | undefined) ?? 'auto',
     noCache:    flags['cache']    === false,
     noIdbCache: flags['idb-cache'] === false,
+    force:      flags['force']    === true,
     timeout:    Number(flags['timeout']) || config.defaults.timeout,
     format:     defaultFormat(flags),
     daemonMode: daemonModeFromFlags(flags),
@@ -600,12 +602,9 @@ async function cmdStatus(
 
   // Resolve the effective hash the run path would use. With --arch, that's the hash of
   // the extracted slice; if it was never extracted, nothing is cached for that arch.
-  const originalHash = binaryHash(binary);
-  let binHash = originalHash;
-  if (arch) {
-    const slicePath = join(expandHome(cacheDir), 'slices', `${originalHash}-${arch}`);
-    binHash = existsSync(slicePath) ? binaryHash(slicePath) : '';
-  }
+  // Resolve the cache key exactly as the run path would (thin binary → whole-binary hash, so
+  // `--arch` on an already-thin binary doesn't spuriously report `none`).
+  const binHash = effectiveHash(binary, arch, cacheDir);
 
   const daemon = binHash ? await daemonFor(cacheDir, backend, binHash) : null;
   const holder = binHash ? analysisLockHolder(cacheDir, daemonKey(backend, binHash)) : null;
@@ -702,7 +701,12 @@ function effectiveHash(binary: string, arch: string | undefined, cacheDir: strin
   const oh = binaryHash(binary);
   if (!arch) return oh;
   const slicePath = join(expandHome(cacheDir), 'slices', `${oh}-${arch}`);
-  return existsSync(slicePath) ? binaryHash(slicePath) : '';
+  if (existsSync(slicePath)) return binaryHash(slicePath);
+  // No slice on disk. A THIN binary has nothing to slice, so the run path keys on the
+  // whole-binary hash — mirror that here so `re status`/`re wait --arch` find the analysis
+  // instead of reporting `none`. Only a fat binary whose slice hasn't been extracted yet has
+  // genuinely nothing cached for that arch.
+  return machoArchs(binary).length > 1 ? '' : oh;
 }
 
 // `re analyze <binary>` — kick off a warm daemon in the background and return at once,
@@ -842,6 +846,8 @@ Global flags:
   --timeout    seconds               Optional hard cap (default: none — runs to completion)
   --no-cache                         Skip result cache
   --no-idb-cache                     Force re-analysis even if .i64 exists (forces one-shot)
+  -f, --force                        Allow a fresh analysis to OVERWRITE an existing cached
+                                     database (otherwise re refuses, to protect prior analysis)
   --daemon     auto | on | off       Warm-database daemon (default: auto). auto starts one
                                      for binaries >= daemon.autostartMinMb; on forces it;
                                      off (or --no-daemon) always runs one-shot
@@ -973,6 +979,7 @@ async function main(): Promise<void> {
         config,
         backend: backend as 'auto' | BackendName,
         timeout,
+        force: flags['force'] === true,
       });
       process.exit(code);
     }
@@ -986,6 +993,7 @@ async function main(): Promise<void> {
     config,
     noCache,
     noIdbCache,
+    force: flags['force'] === true,
     timeout,
     arch: flags['arch'] as string | undefined,
     daemonMode,

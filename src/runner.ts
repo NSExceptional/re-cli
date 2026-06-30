@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import type { BackendName } from './backends/types.ts';
 import type { Config } from './config.ts';
 import type { REResult } from './result.ts';
-import { binaryHash, resultKey, randomId, elapsed, expandHome } from './util.ts';
+import { binaryHash, resultKey, randomId, elapsed, expandHome, machoArchs } from './util.ts';
 import {
   hasIdb, idbPath, idbCacheDir, ensureIdbDir,
   hasHop, hopPath,
@@ -32,6 +32,7 @@ export interface RunOptions {
   config: Config;
   noCache: boolean;
   noIdbCache: boolean;
+  force?: boolean;  // allow a fresh analysis to overwrite an existing cached .i64 (default: refuse)
   timeout: number;
   arch?: string;
   module?: string;  // when set, treat `binary` as a DSC and load this module from it
@@ -144,12 +145,21 @@ function mkError(
 }
 
 function extractSlice(binary: string, arch: string, cacheDir: string, originalHash: string): string {
+  // A thin binary has nothing to slice — `--arch` is a no-op. Return the whole binary so the
+  // run keys on its whole-binary hash, matching what `re status`/`re wait --arch` resolve.
+  // (Previously this only surfaced via lipo failing, which left status/wait reporting `none`.)
+  const archs = machoArchs(binary);
+  if (archs.length <= 1) {
+    process.stderr.write(
+      `[re] ${basename(binary)} is a thin ${archs[0] ?? arch} binary; --arch ${arch} ignored (slicing only applies to fat binaries)\n`);
+    return binary;
+  }
   const sliceDir = join(expandHome(cacheDir), 'slices');
   mkdirSync(sliceDir, { recursive: true });
   const slicePath = join(sliceDir, `${originalHash}-${arch}`);
   if (!existsSync(slicePath)) {
     const { status } = spawnSync('lipo', [binary, '-thin', arch, '-output', slicePath]);
-    if (status !== 0) return binary; // not a fat binary or arch not present
+    if (status !== 0) return binary; // arch not present / lipo failed — fall back to whole binary
   }
   return slicePath;
 }
@@ -344,6 +354,19 @@ export async function run(opts: RunOptions): Promise<REResult> {
   }
 
   let useIdb = !opts.noIdbCache && backend === 'ida' && hasIdb(cacheDir, binHash, opts.module);
+
+  // ── Destructive-overwrite guard ──────────────────────────────────────────────────────
+  // A fresh analysis runs `idat64 -c -o<idb>` which creates a NEW database, DESTROYING any
+  // existing one at that path. Normally `!useIdb` means the cache is empty — but --no-idb-cache
+  // (or a stale/forced path) can trigger fresh analysis while a COMPLETE .i64 is present, and
+  // silently clobber hours of analysis. Refuse unless --force. (Cold binaries — no .i64 — pass
+  // straight through; this only fires when a finished database is about to be overwritten.)
+  if (backend === 'ida' && !useIdb && !opts.force && hasIdb(cacheDir, binHash, opts.module)) {
+    return mkError(opts, binHash, backend, elapsed(start), 'AnalysisExists',
+      `Refusing to overwrite the existing analysis at ${idbPath(cacheDir, binHash, opts.module)}: a fresh ` +
+      `analysis would destroy it. Drop --no-idb-cache to reuse the cached database, pass --force to ` +
+      `re-analyze anyway, or 're cache clear ${basename(opts.binary)}' to discard it first.`);
+  }
   const useHop = !opts.noIdbCache && backend === 'hopper' && hasHop(cacheDir, binHash, opts.module);
 
   const tmpDir = join(tmpdir(), `re_${randomId()}`);
@@ -419,6 +442,7 @@ export async function run(opts: RunOptions): Promise<REResult> {
         hopPath: backend === 'hopper' && useHop ? hopPath(cacheDir, binHash, opts.module) : undefined,
         idleTimeout: opts.config.daemon.idleTimeout,
         timeoutMs: opts.timeout * 1000,
+        force: opts.force,
         extraEnv,
         label,
       }, script);
