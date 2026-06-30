@@ -90,6 +90,7 @@ def _re_stream_run(produce, batch_max=200):
         newly-emitted rows so the caller can tell whether progress is still being made."""
         batch = []
         new_count = 0
+        scanned = 0
 
         def flush():
             if batch:
@@ -97,6 +98,13 @@ def _re_stream_run(produce, batch_max=200):
                 del batch[:]
 
         for ident, row in produce():
+            # Periodic cooperative-stop check so a client abandon / deadline is noticed mid-scan
+            # even on a huge binary where nearly every ident is already delivered (no batch
+            # flushes to gate on). The peek is cheap but not free — sample, don't check per row.
+            scanned += 1
+            if scanned % 4096 == 0 and should_stop():
+                flush()
+                return new_count, True
             if ident is not None:
                 if ident in seen:
                     continue
@@ -123,29 +131,37 @@ def _re_stream_run(produce, batch_max=200):
     if stopped:
         return
 
-    # Incremental loop: wait for the auto-analysis queue to drain a bit (auto_is_ok), or for
-    # a short interval, then rescan. We use the auto-queue-drained signal as the "more may
-    # have appeared" trigger (equivalent to an auto_queue_empty hook, but pull-based so it
-    # composes with the deadline/stop checks without holding IDA's UI hook lock). Loop ends
-    # when the deadline passes OR analysis fully settles AND a rescan finds nothing new.
+    # Incremental loop (§11.2.1): ADVANCE analysis by a slice, then rescan and emit the
+    # newly-discovered items, until the deadline / a stop condition / the database settling.
+    # The daemon injects `_re_advance_analysis_chunk` (auto_wait_range over address windows):
+    # in headless IDA, autoanalysis ONLY progresses while such a call runs on the main thread,
+    # so the old `sleep(1.0)` advanced nothing and never streamed past the first scan on a
+    # cold binary — the Phase-3 fix. We fall back to a plain sleep if the advancer is absent
+    # (e.g. an older daemon), preserving the previous behavior.
     import time as _t
+    advance = g.get('_re_advance_analysis_chunk')
     deadline = _t.time() + deadline_total
     idle_rescans = 0
+    stalled_rounds = 0
     while _t.time() < deadline:
         if should_stop():
             state['reason'] = 'max_matches'
             return
-        try:
-            settled = _ida_auto.auto_is_ok()
-        except Exception:
-            settled = True
-        # Give analysis a slice of time to surface more items before rescanning.
-        _t.sleep(1.0)
+        if advance is not None:
+            advanced, settled = advance()
+        else:
+            _t.sleep(1.0)
+            try:
+                settled = _ida_auto.auto_is_ok()
+            except Exception:
+                settled = True
+            advanced = not settled
         new_count, stopped = _scan_once()
         if stopped:
             return
         progress('done' if settled else 'analyzing', 100 if settled else None)
         if settled:
+            stalled_rounds = 0
             # Analysis is done. One clean rescan with nothing new ⇒ the result set is final.
             if new_count == 0:
                 idle_rescans += 1
@@ -155,5 +171,21 @@ def _re_stream_run(produce, batch_max=200):
                     return
             else:
                 idle_rescans = 0
+        elif not advanced:
+            # Address-windowing is exhausted (stalled) but the queue never reported settled —
+            # common when residual non-function work keeps auto_is_ok() False indefinitely. If
+            # repeated rescans surface nothing new, no more items are coming via this mechanism,
+            # so finish promptly with `natural` instead of idling out the whole --max-wait
+            # budget. (A few grace rounds first, in case auto_queue_empty work is imminent.)
+            if new_count == 0:
+                stalled_rounds += 1
+                if stalled_rounds >= 3:
+                    state['reason'] = 'natural'
+                    return
+                _t.sleep(0.5)
+            else:
+                stalled_rounds = 0
+        else:
+            stalled_rounds = 0
     # Hit the deadline with analysis still going: stream is "natural" (more may exist later).
     state['reason'] = 'natural'

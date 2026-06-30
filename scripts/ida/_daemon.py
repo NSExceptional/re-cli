@@ -66,6 +66,132 @@ def _save_database(path):
         return False
 
 
+# ─── Incremental analysis driver (issue #13 Phase 3) ────────────────────────────────
+#
+# Headless IDA is single-threaded: autoanalysis only progresses while an auto_wait* call
+# runs on the main thread. The old daemon called one blocking auto_wait() up front (so the
+# socket bound only after ~80 min on a huge Swift binary) and the streaming wait was a pure
+# sleep() loop that never ADVANCED analysis. Both are fixed by advancing analysis in bounded
+# address-window slices via auto_wait_range, so the daemon stays reachable AND a streaming
+# query can emit partials + check its deadline between slices. The frontier is module-global
+# so progress accumulates across the idle loop and successive queries.
+
+_ADV = {
+    'ranges': None,    # [(start,end)] code segments, computed lazily after load
+    'frontier': None,  # next EA to sweep
+    'swept': False,    # covered the whole span at least once this pass
+    'last_qty': -1,    # func count at the end of the last completed sweep (stall detection)
+    'stalled': False,  # windowing can no longer surface new work (e.g. undriveable queue)
+}
+# Window size for one analysis slice. Smaller = the daemon returns to its accept loop sooner
+# (more responsive to new queries) and gives finer partials; larger = less per-slice overhead.
+# 256 KB keeps a normal slice short; note a slice that drains the global queue can still
+# trigger an uninterruptible global pass (e.g. Swift metadata) regardless of this size — the
+# client's hard deadline is what bounds a query across such a slice.
+ADVANCE_WINDOW = int(os.environ.get('RE_ADVANCE_WINDOW', '0x40000') or '0x40000', 16)
+
+
+def _safe_auto_is_ok():
+    try:
+        return bool(ida_auto.auto_is_ok())
+    except Exception:
+        # If we can't tell, treat as settled so callers don't spin forever.
+        return True
+
+
+def _adv_ranges():
+    if _ADV['ranges'] is None:
+        rs = []
+        try:
+            import ida_segment
+            seg = ida_segment.get_first_seg()
+            while seg:
+                try:
+                    code = (seg.type == idaapi.SEG_CODE)
+                except Exception:
+                    code = True
+                if code:
+                    rs.append((seg.start_ea, seg.end_ea))
+                seg = ida_segment.get_next_seg(seg.start_ea)
+        except Exception:
+            rs = []
+        if not rs:
+            try:
+                rs = [(idaapi.inf_get_min_ea(), idaapi.inf_get_max_ea())]
+            except Exception:
+                rs = []
+        _ADV['ranges'] = rs
+        _ADV['frontier'] = rs[0][0] if rs else None
+    return _ADV['ranges']
+
+
+def _advance_analysis_chunk():
+    """Advance autoanalysis by ~one address window and return (advanced, settled).
+
+    `advanced` is True if a slice ran (more may have appeared); `settled` is auto_is_ok().
+    Re-sweeps after a full pass to pick up work enqueued by auto_queue_empty (e.g. the Swift
+    metadata pass, which only fires once the global queue drains). If a whole sweep surfaces
+    no new functions and the queue still isn't settled, sets `_ADV['stalled']` so callers
+    stop spinning on work that address-windowing cannot drive."""
+    if _safe_auto_is_ok():
+        _ADV['stalled'] = False
+        return (False, True)
+    if not hasattr(ida_auto, 'auto_wait_range'):
+        ida_auto.auto_wait()  # no incremental API on this IDA — one bounded full wait
+        return (False, _safe_auto_is_ok())
+    ranges = _adv_ranges()
+    if not ranges:
+        ida_auto.auto_wait()
+        return (False, _safe_auto_is_ok())
+
+    if not _ADV['swept']:
+        f = _ADV['frontier'] if _ADV['frontier'] is not None else ranges[0][0]
+        for (s, e) in ranges:
+            if f < e:
+                a = f if f > s else s
+                b = a + ADVANCE_WINDOW
+                if b > e:
+                    b = e
+                ida_auto.auto_wait_range(a, b)
+                _ADV['frontier'] = b
+                if b >= ranges[-1][1]:
+                    _ADV['swept'] = True
+                return (True, _safe_auto_is_ok())
+        _ADV['swept'] = True
+
+    # Whole span swept once and still not settled (top guard). If new functions appeared,
+    # more work is likely queued (Swift pass) — re-sweep from the start to process it.
+    try:
+        import ida_funcs
+        qty = ida_funcs.get_func_qty()
+    except Exception:
+        qty = -1
+    if qty != _ADV['last_qty']:
+        _ADV['last_qty'] = qty
+        _ADV['swept'] = False
+        _ADV['frontier'] = ranges[0][0]
+        return (True, _safe_auto_is_ok())
+
+    # A full sweep surfaced nothing new yet the queue isn't settled: address-windowing can't
+    # drive whatever is left. Mark stalled so the idle loop stops advancing (a client query
+    # that calls a full auto_wait can still finalize it).
+    _ADV['stalled'] = True
+    return (False, _safe_auto_is_ok())
+
+
+def _maybe_save_settled(saved_flag):
+    """Persist the freshly analyzed .i64 exactly once, only when analysis has truly settled.
+    Saving a PARTIAL database to the cache path would let later one-shot runs reload it and
+    serve incomplete results as if complete, so we never save mid-analysis (this intentionally
+    narrows spec §11.4's 'save after every query' for one-shot cache correctness)."""
+    if saved_flag[0] or not SAVE_IDB:
+        return
+    if _safe_auto_is_ok():
+        _log('analysis settled; saving database to %s' % SAVE_IDB)
+        _save_database(SAVE_IDB)
+        saved_flag[0] = True
+
+
 def _recvn(conn, n):
     buf = b''
     while len(buf) < n:
@@ -175,6 +301,9 @@ def _stream_exec(conn, req):
         '_re_deadline_wait': _deadline,
         '_RE_STREAM_DEADLINE': deadline_sec,
         '_re_stream_state': state,
+        # Phase 3: the chunked driver in _base.py uses this to ADVANCE analysis between
+        # rescans (auto_wait_range slices) instead of sleeping while nothing progresses.
+        '_re_advance_analysis_chunk': _advance_analysis_chunk,
     }
     try:
         exec(compile(script, '<re-stream>', 'exec'), ns)
@@ -227,6 +356,12 @@ def _handle(req):
             'pid': os.getpid(),
             'kernel': idaapi.get_kernel_version(),
             'input': idc.get_input_file_path(),
+            # Phase 3: with the socket bound before analysis finishes, "connectable" no longer
+            # means "done". Report a stable-state signal so `re status`/`re wait` show WARMING
+            # vs READY truthfully: either the queue truly drained (auto_is_ok) OR address-
+            # windowing exhausted (stalled). Some binaries keep auto_is_ok() False indefinitely
+            # on residual non-function work, so stalled is what makes `re wait` terminate.
+            'settled': _safe_auto_is_ok() or bool(_ADV.get('stalled')),
             'stream': stream,
         }}, False
 
@@ -252,14 +387,10 @@ def _serve():
         idc.qexit(2)
         return
 
-    _log('analysis: waiting for autoanalysis to finish…')
-    ida_auto.auto_wait()
-
-    if SAVE_IDB:
-        _log('saving database to %s' % SAVE_IDB)
-        _save_database(SAVE_IDB)
-
-    # Bind only now: the client treats "socket is connectable" as "daemon ready".
+    # Bind BEFORE analysis finishes (Phase 3): the daemon must be reachable WHILE a huge
+    # binary is still analyzing, so a streaming query can attach and drive/observe partial
+    # results instead of the client blocking ~80 min waiting for the socket to appear. The
+    # old code called a blocking auto_wait() here first — that was the cold-stream hang.
     try:
         os.makedirs(os.path.dirname(SOCK_PATH), exist_ok=True)
     except OSError:
@@ -272,14 +403,29 @@ def _serve():
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK_PATH)
     srv.listen(16)
-    srv.settimeout(IDLE_SEC)
-    _log('ready, listening on %s (idle timeout %ss)' % (SOCK_PATH, IDLE_SEC))
+    _log('listening on %s (analysis in progress; idle timeout %ss)' % (SOCK_PATH, IDLE_SEC))
+
+    # While warming with no client connected, advance analysis a slice between accept()
+    # attempts so the database keeps progressing (and eventually settles + saves) in the
+    # background. A short accept timeout keeps first-connect latency to about one slice.
+    WARM_TICK = float(os.environ.get('RE_WARM_TICK', '0.5') or '0.5')
+    saved = [False]
 
     quit_requested = False
     while not quit_requested:
+        settled = _safe_auto_is_ok()
+        if settled:
+            _maybe_save_settled(saved)
+        # Warming = not settled AND address-windowing can still surface new work. Once settled
+        # or stalled, use the long idle timeout (the analysis cannot be advanced further here).
+        warming = (not settled) and (not _ADV['stalled'])
+        srv.settimeout(WARM_TICK if warming else IDLE_SEC)
         try:
             conn, _ = srv.accept()
         except socket.timeout:
+            if warming:
+                _advance_analysis_chunk()  # background slice, then re-check for a client
+                continue
             _log('idle timeout reached; shutting down')
             break
         except Exception as e:
@@ -295,9 +441,11 @@ def _serve():
                 if req.get('type') == 'stream_exec':
                     # Streaming requests write their own frames (many) then a terminal one.
                     _stream_exec(conn, req)
+                    _maybe_save_settled(saved)  # the stream may have settled analysis
                     continue
                 resp, should_quit = _handle(req)
                 _send_frame(conn, resp)
+                _maybe_save_settled(saved)  # a legacy full auto_wait() may have settled it
                 if should_quit:
                     quit_requested = True
                     break

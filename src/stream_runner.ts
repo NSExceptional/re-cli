@@ -374,12 +374,58 @@ async function runStreamOnce(ctx: RunContext): Promise<number> {
       return emitTerminalError(sink, queryId, 'ida_crashed',
         `could not start a streaming IDA session: ${started.error}`, ctx.runningCount, null);
     }
+    if (started.status === 'warming') {
+      // Phase 3 (acceptance #1/#5): the daemon is still loading/analyzing this cold binary and
+      // didn't become connectable within the --max-wait budget. Return a deterministic
+      // terminal event — never a hang, never NoOutput. Analysis continues in the background;
+      // a later query (or --resume) attaches to the now-warmer database.
+      emitMeta(ctx, started.pid);
+      ctx.cacheState = classifyCache(ctx.cacheDir, ctx.binHash, ctx.effectiveBinary, ctx.opts.module);
+      const complete: CompleteEvent = {
+        event: 'complete', query_id: queryId, ts: now(),
+        count: 0, reason: 'max_wait', durationSec: elapsed(start),
+        cursor: ctx.seen.size ? cursorFor(ctx) : null, cache_state: ctx.cacheState,
+      };
+      sink.push(complete);
+      return exitCodeFor('complete');
+    }
     emitMeta(ctx, started.pid);
     handle = started.handle;
     if (stopRequested) handle.stop();
 
-    const { terminal, closedEarly } = await handle.done;
+    // Hard client-side deadline (Phase 3). The daemon's cooperative stop is only checked
+    // BETWEEN analysis slices, and a single auto_wait_range slice or a full rescan over a huge
+    // binary (100k+ functions) can't be interrupted mid-call — so on big binaries the daemon
+    // can overshoot --max-wait by minutes. Guarantee the user-facing bound here: if no terminal
+    // frame arrives within the deadline + a short grace, stop the stream, flush what we have,
+    // and synthesize the terminal ourselves. The orphaned daemon stream notices the closed
+    // socket on its next check and unwinds, keeping the database warming in the background.
+    const HARD_GRACE_MS = 5000;
+    const hardCapMs = ctx.deadlineSec * 1000 + HARD_GRACE_MS;
+    const capped = await Promise.race([
+      handle.done.then((d) => ({ timedOut: false as const, ...d })),
+      sleep(Math.max(0, hardCapMs - (Date.now() - start))).then(() => ({ timedOut: true as const })),
+    ]);
     flushPending(true);
+
+    if (capped.timedOut) {
+      handle.stop();  // best-effort: tell the daemon to unwind at its next slice boundary
+      ctx.cacheState = classifyCache(ctx.cacheDir, ctx.binHash, ctx.effectiveBinary, ctx.opts.module);
+      if (interrupted) {
+        sink.push({
+          event: 'interrupted', query_id: queryId, ts: now(),
+          partial_count: ctx.runningCount, cursor: cursorFor(ctx), cache_state: ctx.cacheState,
+        } as InterruptedEvent);
+        return exitCodeFor('interrupted');
+      }
+      sink.push({
+        event: 'complete', query_id: queryId, ts: now(),
+        count: ctx.runningCount, reason: stopReason ?? 'max_wait',
+        durationSec: elapsed(start), cursor: cursorFor(ctx), cache_state: ctx.cacheState,
+      } as CompleteEvent);
+      return exitCodeFor('complete');
+    }
+    const { terminal, closedEarly } = capped;
 
     if (interrupted) {
       const interruptedCount = ctx.snapshotMode ? pending.length : ctx.runningCount;
@@ -471,8 +517,18 @@ async function runWatch(ctx: RunContext): Promise<number> {
     };
     const started = await runStreamOnDaemon(ctx.spec, script, passDeadline, onFrame, op);
     if (started.status === 'unavailable') return { error: started.error };
-    const { terminal } = await started.handle.done;
-    if (terminal && terminal.ok === false) return { error: terminal.error ?? 'watch pass failed' };
+    // Cold binary still warming: no items this pass — emit an empty snapshot and keep polling
+    // until the daemon's socket binds and analysis surfaces matches (Phase 3).
+    if (started.status === 'warming') return { items: [], pid: started.pid };
+    // Hard bound (Phase 3): don't wait past the pass deadline + grace for a daemon stuck in an
+    // uninterruptible slice — take whatever items arrived and let the next poll continue.
+    const handle = started.handle;
+    const res = await Promise.race([
+      handle.done.then((d) => ({ timedOut: false as const, terminal: d.terminal })),
+      sleep((passDeadline + 5) * 1000).then(() => ({ timedOut: true as const, terminal: undefined })),
+    ]);
+    if (res.timedOut) handle.stop();
+    if (res.terminal && res.terminal.ok === false) return { error: res.terminal.error ?? 'watch pass failed' };
     return { items: collected, pid: started.pid };
   };
 

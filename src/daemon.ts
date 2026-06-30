@@ -294,14 +294,22 @@ async function waitReady(
   label: string,
   timeoutMs: number,
   isAlive?: () => boolean,
-): Promise<boolean> {
+  maxWaitMs?: number,
+): Promise<'ready' | 'timeout' | 'dead'> {
+  // Phase 3: the daemon now binds its socket BEFORE finishing analysis, so for a warm or
+  // already-loaded binary this returns 'ready' fast. `maxWaitMs` (the streaming query's
+  // --max-wait budget) bounds how long we'll wait for a still-loading cold binary's socket to
+  // appear: on expiry we return 'timeout' (the daemon is alive and warming) so the caller can
+  // emit a deterministic complete{max_wait} instead of blocking on a long cold analysis.
   const stop = startNarrator(logPath, label);
   const start = Date.now();
   try {
     while (true) {
-      if (await canConnect(socketPath)) return true;
-      if (timeoutMs > 0 && Date.now() - start > timeoutMs) return false;
-      if (isAlive && !isAlive()) return false;
+      if (await canConnect(socketPath)) return 'ready';
+      const elapsed = Date.now() - start;
+      if (timeoutMs > 0 && elapsed > timeoutMs) return 'timeout';
+      if (maxWaitMs !== undefined && maxWaitMs > 0 && elapsed > maxWaitMs) return 'timeout';
+      if (isAlive && !isAlive()) return 'dead';
       await sleep(400);
     }
   } finally {
@@ -355,15 +363,25 @@ function spawnDaemon(spec: DaemonRunSpec, key: string, socketPath: string, logPa
   return pid;
 }
 
-async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string, dir: string, logPath: string)
-  : Promise<{ ok: true } | { ok: false; error: string }> {
+async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string, dir: string, logPath: string, maxWaitMs?: number)
+  : Promise<{ ok: true } | { ok: false; error: string; warming?: boolean }> {
   // 1. Reuse a healthy existing daemon. (binaryHash already keys on path+mtime+size, so a
   //    changed binary routes to a different key — no explicit staleness recheck needed.)
   const existing = readMeta(dir);
-  if (existing && pidAlive(existing.pid) && await canConnect(socketPath)) {
-    return { ok: true };
+  if (existing && pidAlive(existing.pid)) {
+    if (await canConnect(socketPath)) return { ok: true };
+    // Phase 3: the daemon PROCESS is alive but its socket isn't bound yet — it now binds
+    // mid-analysis, so this is WARMING, not failed. Wait for its socket (bounded by the
+    // caller's deadline) instead of spawning a second IDA on the same binary — that rival
+    // process is the duplicate-process bug (acceptance #3). A stale start-lock left by a
+    // crashed/killed client must not divert us into starting one.
+    const r = await waitReady(socketPath, logPath, spec.label, spec.timeoutMs, () => pidAlive(existing.pid), maxWaitMs);
+    if (r === 'ready') return { ok: true };
+    if (r === 'timeout') return { ok: false, warming: true, error: 'daemon warming (startup deadline reached)' };
+    cleanup(dir, socketPath);  // 'dead': daemon died while waiting — fall through to restart
+  } else if (existing && !pidAlive(existing.pid)) {
+    cleanup(dir, socketPath);
   }
-  if (existing && !pidAlive(existing.pid)) cleanup(dir, socketPath);
 
   // 2. Become the starter, or wait for whoever already is. Atomic mkdir is the lock so
   //    two concurrent first-queries can't both analyze.
@@ -381,15 +399,19 @@ async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string,
     try {
       try { writeFileSync(join(lockDir, 'pid'), String(process.pid)); } catch {}
       const pid = spawnDaemon(spec, key, socketPath, logPath);
-      const ready = await waitReady(socketPath, logPath, spec.label, spec.timeoutMs, () => pidAlive(pid));
-      if (!ready) return { ok: false, error: 'daemon failed to become ready' };
+      // Register immediately (Phase 3): the socket now binds mid-analysis, so we may return
+      // while the daemon is still warming. Writing meta now keeps it discoverable (consumers
+      // gate readiness on canConnect, so an unconnectable warming daemon reads as not-ready).
       writeMeta(dir, {
         pid, socketPath, backend: spec.backend,
         binaryPath: spec.binaryPath, binHash: spec.binHash,
         ...(spec.module ? { module: spec.module } : {}),
         startedAt: Date.now(),
       });
-      return { ok: true };
+      const ready = await waitReady(socketPath, logPath, spec.label, spec.timeoutMs, () => pidAlive(pid), maxWaitMs);
+      if (ready === 'ready') return { ok: true };
+      if (ready === 'timeout') return { ok: false, warming: true, error: 'daemon still warming (startup deadline reached)' };
+      return { ok: false, error: 'daemon failed to become ready' };
     } finally {
       try { rmSync(lockDir, { recursive: true, force: true }); } catch {}
     }
@@ -406,8 +428,9 @@ async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string,
     try { return pidAlive(Number(readFileSync(join(lockDir, 'pid'), 'utf8'))); }
     catch { return existsSync(lockDir); }
   };
-  const ready = await waitReady(socketPath, logPath, spec.label, spec.timeoutMs, starterAlive);
-  if (ready) return { ok: true };
+  const ready = await waitReady(socketPath, logPath, spec.label, spec.timeoutMs, starterAlive, maxWaitMs);
+  if (ready === 'ready') return { ok: true };
+  if (ready === 'timeout') return { ok: false, warming: true, error: 'daemon (started by another process) still warming' };
   return { ok: false, error: 'daemon (started by another process) did not become ready' };
 }
 
@@ -435,11 +458,23 @@ export async function daemonFor(
   backend: BackendName,
   binHash: string,
   module?: string,
-): Promise<{ pid: number; startedAt: number; ready: boolean } | null> {
+): Promise<{ pid: number; startedAt: number; ready: boolean; settled: boolean | null } | null> {
   const dir = registryDir(cacheDir, daemonKey(backend, binHash, module));
   const meta = readMeta(dir);
   if (!meta || !pidAlive(meta.pid)) return null;
-  return { pid: meta.pid, startedAt: meta.startedAt, ready: await canConnect(meta.socketPath) };
+  const ready = await canConnect(meta.socketPath);
+  // Phase 3: the socket now binds mid-analysis, so "connectable" no longer implies "done".
+  // Ping for the settled flag (auto_is_ok) so `re status`/`re wait` can tell a streamable
+  // but still-warming daemon apart from a fully-analyzed one. null = couldn't determine.
+  let settled: boolean | null = null;
+  if (ready) {
+    try {
+      const r = await sendRequest(meta.socketPath, { id: 1, type: 'ping' }, 2000);
+      const v = r?.meta?.settled;
+      settled = typeof v === 'boolean' ? v : null;
+    } catch { settled = null; }
+  }
+  return { pid: meta.pid, startedAt: meta.startedAt, ready, settled };
 }
 
 // Is a daemon currently STARTING for this binary — analyzing before its socket binds and
@@ -495,6 +530,11 @@ export async function runOnDaemon(spec: DaemonRunSpec, scriptText: string): Prom
   const ready = await ensureReady(spec, key, socketPath, dir, logPath);
   if (!ready.ok) return { status: 'unavailable', error: ready.error };
 
+  // Phase 3: the socket binds mid-analysis, so a cold-binary exec drives autoanalysis inside
+  // the daemon (via the op script's auto_wait) and can take minutes. Narrate the daemon's
+  // analysis log meanwhile so a legacy (non-streaming) query stays observable instead of
+  // blocking silently — previously waitReady narrated this window before the socket bound.
+  const stopNarrator = startNarrator(logPath, spec.label);
   try {
     const resp = await sendRequest(socketPath, { id: 1, type: 'exec', script: scriptText }, spec.timeoutMs);
     if (resp?.ok) return { status: 'served' };
@@ -502,6 +542,8 @@ export async function runOnDaemon(spec: DaemonRunSpec, scriptText: string): Prom
   } catch (e) {
     // Connection dropped mid-flight (e.g. daemon crashed): let the caller fall back.
     return { status: 'unavailable', error: `daemon request failed: ${e instanceof Error ? e.message : String(e)}` };
+  } finally {
+    stopNarrator();
   }
 }
 
@@ -516,6 +558,7 @@ export async function runStreamOnDaemon(
   op?: string,
 ): Promise<
   | { status: 'streaming'; pid: number; handle: StreamExecHandle }
+  | { status: 'warming'; pid: number }
   | { status: 'unavailable'; error: string }
 > {
   const key = daemonKey(spec.backend, spec.binHash, spec.module);
@@ -523,8 +566,17 @@ export async function runStreamOnDaemon(
   const dir = registryDir(spec.cacheDir, key);
   const logPath = join(dir, 'daemon.log');
 
-  const ready = await ensureReady(spec, key, socketPath, dir, logPath);
-  if (!ready.ok) return { status: 'unavailable', error: ready.error };
+  // Bound the startup wait by the stream's deadline (--max-wait budget): a cold huge binary
+  // can take minutes just to LOAD before its socket binds, and we must never block past the
+  // budget. On expiry the daemon keeps warming in the background and we report 'warming'.
+  const ready = await ensureReady(spec, key, socketPath, dir, logPath, deadlineSec * 1000);
+  if (!ready.ok) {
+    if (ready.warming) {
+      const pid = readMeta(dir)?.pid ?? daemonStarting(spec.cacheDir, spec.backend, spec.binHash, spec.module) ?? -1;
+      return { status: 'warming', pid };
+    }
+    return { status: 'unavailable', error: ready.error };
+  }
 
   const meta = readMeta(dir);
   const pid = meta?.pid ?? -1;
@@ -542,19 +594,22 @@ export async function listDaemons(cacheDir: string): Promise<DaemonStatus[]> {
     const dir = join(base, key);
     const meta = readMeta(dir);
     if (!meta) continue;
-    const alive = pidAlive(meta.pid) && await canConnect(meta.socketPath);
+    // Phase 3: prune ONLY when the process is dead. A daemon that's alive but not yet
+    // connectable is WARMING (binds its socket mid-analysis) — pruning it here would orphan
+    // a live IDA (undiscoverable, and the next query would spawn a duplicate). `alive` in the
+    // listing means "connectable/ready"; warming daemons list as not-ready but are kept.
+    if (!pidAlive(meta.pid)) { cleanup(dir, meta.socketPath); continue; }
+    const connectable = await canConnect(meta.socketPath);
     let input: string | null = null;
-    if (alive) {
+    if (connectable) {
       try {
         const r = await sendRequest(meta.socketPath, { id: 1, type: 'ping' }, 2000);
         input = r?.meta?.input ?? null;
       } catch {}
-    } else {
-      cleanup(dir, meta.socketPath); // prune dead entries lazily
     }
     out.push({
       key, backend: meta.backend, binaryPath: meta.binaryPath,
-      module: meta.module, pid: meta.pid, alive, startedAt: meta.startedAt, input,
+      module: meta.module, pid: meta.pid, alive: connectable, startedAt: meta.startedAt, input,
     });
   }
   return out;

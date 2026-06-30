@@ -621,8 +621,14 @@ async function cmdStatus(
     database = { exists: true, path: p, sizeMb: +(s.size / 1048576).toFixed(1), mtime: new Date(s.mtimeMs).toISOString() };
   }
 
-  const warming = (daemon != null && !daemon.ready) || holder != null || starting != null;
-  const ready = (daemon != null && daemon.ready) || idbExists;
+  // Phase 3: a daemon's socket binds mid-analysis, so `ready` (connectable) no longer means
+  // "fully analyzed". A connectable-but-unsettled daemon is WARMING (streamable, not done);
+  // only a settled daemon (or a persisted .i64) is READY. settled===null (couldn't ping) is
+  // treated as ready to avoid regressing the warm path on a transient ping failure.
+  const daemonDone = daemon != null && daemon.ready && daemon.settled !== false;
+  const daemonWarming = daemon != null && (!daemon.ready || daemon.settled === false);
+  const warming = daemonWarming || holder != null || starting != null;
+  const ready = daemonDone || idbExists;
   const state = ready ? 'ready' : warming ? 'warming' : 'none';
   const now = Date.now();
 
@@ -651,7 +657,7 @@ async function cmdStatus(
   const data = {
     binary, arch: arch ?? null, backend, binaryHash: binHash || null, state,
     daemon: daemon
-      ? { running: true, ready: daemon.ready, pid: daemon.pid, uptimeSec: Math.round((now - daemon.startedAt) / 1000) }
+      ? { running: true, ready: daemon.ready, settled: daemon.settled, pid: daemon.pid, uptimeSec: Math.round((now - daemon.startedAt) / 1000) }
       : { running: false },
     analysis: holder
       ? {
@@ -670,7 +676,7 @@ async function cmdStatus(
 
   if (format === 'pretty') {
     console.log(`${binary}${arch ? ` (${arch})` : ''} — ${state.toUpperCase()}`);
-    if (data.daemon.running) console.log(`  daemon     pid ${daemon!.pid}, up ${data.daemon.uptimeSec}s${daemon!.ready ? '' : ' (warming)'}${phase ? ` · ${phase}` : ''}`);
+    if (data.daemon.running) console.log(`  daemon     pid ${daemon!.pid}, up ${data.daemon.uptimeSec}s${daemonDone ? '' : ' (warming)'}${phase ? ` · ${phase}` : ''}`);
     if (holder) console.log(`  analyzing  pid ${holder.pid || '?'}, ${data.analysis.elapsedSec ?? '?'}s elapsed${phase ? ` · ${phase}` : ''}`);
     else if (starting != null) console.log(`  analyzing  pid ${starting} (daemon starting)${phase ? ` · ${phase}` : ''}`);
     if (streamItems !== null) {
@@ -747,8 +753,11 @@ async function cmdWait(
     const bh = effectiveHash(binary, arch, cacheDir);
     if (!bh) return false;
     if (hasIdb(cacheDir, bh)) return true;
+    // Phase 3: wait for the analysis to be SETTLED, not merely for the socket to bind (which
+    // now happens mid-analysis). A persisted .i64 (above) or a daemon reporting settled both
+    // mean full results are available.
     const d = await daemonFor(cacheDir, backend, bh);
-    return d != null && d.ready;
+    return d != null && d.ready && d.settled === true;
   };
 
   let lastBeat = 0;
