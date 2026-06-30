@@ -22,9 +22,11 @@ import {
 } from './daemon.ts';
 import {
   EventSink, identityOf, newQueryId, now,
+  encodeCursor, decodeCursor, CursorError, diffSnapshots,
+  newCadenceState, shouldEmitStatus, shouldEmitProgress,
   type ResolvedStream, type CacheState, type CompleteReason, type ErrorKind,
   type StreamEvent, type MetaEvent, type CompleteEvent, type ErrorEvent, type InterruptedEvent,
-  type PartialEvent, type SnapshotEvent,
+  type PartialEvent, type SnapshotEvent, type DeltaEvent, type StatusEvent, type ProgressEvent,
 } from './stream.ts';
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
@@ -40,21 +42,36 @@ export interface StreamRunOptions {
   timeout: number;  // seconds; 0 = none
 }
 
+// Options that tune one streaming-script invocation (issue #13 phase 2):
+//   resumeSeen  — identities the prior (interrupted) run already delivered; the script
+//                 skips them so they are never re-emitted (server-side dedup, §5.4/§9).
+//   watchPass   — true for a --watch re-run: do a single snapshot pass (no deadline wait,
+//                 no incremental subscription) so the runner can diff it for deltas.
+interface ScriptOptions {
+  resumeSeen?: string[];
+  watchPass?: boolean;
+}
+
 // Compose the streaming script: same preamble + _base.py the one-shot path uses, then the
 // `<op>.stream.py` body (which drives the daemon-injected emit/should_stop helpers).
-function composeStreamScript(op: string, params: Record<string, unknown>): string {
+function composeStreamScript(op: string, params: Record<string, unknown>, opts: ScriptOptions = {}): string {
   const basePath = join(SCRIPTS_DIR, 'ida', '_base.py');
   const bodyPath = join(SCRIPTS_DIR, 'ida', `${op}.stream.py`);
   if (!existsSync(bodyPath)) throw new Error(`No streaming script for op '${op}'`);
   // _RE_OUTPUT_PATH is unused by streaming scripts but the preamble/_base.py reference it;
   // pass a harmless placeholder so the shared base loads cleanly.
   const paramsHex = Buffer.from(JSON.stringify(params)).toString('hex');
+  // Resume watermark travels as hex-encoded JSON like params so odd identity strings can't
+  // break the literal. The script reads _RE_RESUME_SEEN (a set) and skips those identities.
+  const seenHex = Buffer.from(JSON.stringify(opts.resumeSeen ?? [])).toString('hex');
   const preamble = [
     'import json as _json',
     'import os as _os',
     `_RE_OUTPUT_PATH = ${JSON.stringify('/dev/null')}`,
     `_RE_COMMAND = ${JSON.stringify(op)}`,
     `_RE_PARAMS = _json.loads(bytes.fromhex(${JSON.stringify(paramsHex)}))`,
+    `_RE_RESUME_SEEN = set(_json.loads(bytes.fromhex(${JSON.stringify(seenHex)})))`,
+    `_RE_WATCH_PASS = ${opts.watchPass ? 'True' : 'False'}`,
     '',
   ].join('\n');
   return preamble + '\n' + readFileSync(basePath, 'utf8') + '\n' + readFileSync(bodyPath, 'utf8');
@@ -123,18 +140,38 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
 
   let cacheState = classifyCache(cacheDir, binHash, effectiveBinary, opts.module);
 
+  // §9 / acceptance: a stale .i64 (binary mtime newer than the cached database) is corrupt
+  // wrt this binary. Emit terminal error.kind:"cache_corrupt" rather than silently
+  // re-analyzing inside a --max-wait budget. (Our binHash folds in mtime+size so a changed
+  // binary usually routes to a fresh key; this defends the rare in-place-same-key case.)
+  if (cacheState === 'stale') {
+    return emitTerminalError(sink, queryId, 'cache_corrupt',
+      `cached database is stale: ${opts.binary} was modified after its .i64 was built. ` +
+      `Delete the cache (re cache clear) or re-run without a cache to re-analyze.`,
+      0, null);
+  }
+
+  // ── --resume (§4.3, §9; acceptance #4): decode the cursor against THIS binary+op. A
+  //    mismatch (different binary, wrong op, corrupt, or a v1 placeholder) is a hard
+  //    validate error so resume never silently re-delivers or dedups the wrong set. ──
+  const resumeSeen: string[] = [];
+  if (resolved.flags.resume !== undefined) {
+    try {
+      const payload = decodeCursor(resolved.flags.resume, binHash, op);
+      resumeSeen.push(...payload.w);
+    } catch (e) {
+      if (e instanceof CursorError) {
+        return emitTerminalError(sink, queryId, 'validate_error', e.message, 0, null);
+      }
+      throw e;
+    }
+  }
+
   // Temp dir for the daemon log / save path bookkeeping (mirrors runner.run).
   const useIdb = cacheState === 'warm';
   const outputIdbPath = useIdb
     ? undefined
     : join(ensureIdbDir(cacheDir, binHash, opts.module), 'binary.i64');
-
-  let script: string;
-  try { script = composeStreamScript(op, opts.params); }
-  catch (e) {
-    return emitTerminalError(sink, queryId, 'script_crashed',
-      `failed to compose streaming script: ${e instanceof Error ? e.message : String(e)}`, 0, null);
-  }
 
   const sizeMb = statSync(effectiveBinary).size / 1048576;
   const label = `ida ${op} (stream): ${useIdb ? 'warm db' : 'fresh analysis'} of ${basename(opts.binary)} (${sizeMb.toFixed(1)} MB)`;
@@ -157,80 +194,117 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
   const deadlineSec = resolved.flags.maxWait ?? DEFAULT_DEADLINE;
 
   // Snapshot mode (§5.5): a warm cache with neither --stream nor a stop condition emits a
-  // single `snapshot` of all items, then `complete` — instead of incremental `partial`s.
-  const snapshotMode = cacheState === 'warm' && !resolved.flags.stream && !resolved.bounded;
+  // single `snapshot` of all items, then `complete`. --watch ALSO starts with a snapshot
+  // (§5.6) regardless of cache state, then transitions to deltas.
+  const snapshotMode = (cacheState === 'warm' && !resolved.flags.stream && !resolved.bounded)
+    || resolved.flags.watch;
 
-  // Will the daemon already be serving (so meta.ida_pid is known up front)? We learn the
-  // real pid after runStreamOnDaemon; emit meta after we connect so ida_pid is accurate.
-  // Stop-condition + dedup state.
-  const seen = new Set<string>();
-  let runningCount = 0;
-  let stopReason: CompleteReason | null = null;
-  const pending: Record<string, unknown>[] = [];  // min-batch-size buffer / snapshot accumulator
+  // Shared run context so the initial pass and the watch loop see the same state/helpers.
+  const ctx: RunContext = {
+    opts, resolved, op, queryId, start, sink, cacheDir, binHash, effectiveBinary, spec,
+    deadlineSec, snapshotMode,
+    seen: new Set<string>(resumeSeen),  // server-side dedup seeded with the resume watermark
+    resumeSeen,
+    runningCount: 0,
+    cacheState,
+  };
+
+  return resolved.flags.watch ? runWatch(ctx) : runStreamOnce(ctx);
+}
+
+// ─── Shared run context ────────────────────────────────────────────────────────────
+
+interface RunContext {
+  opts: StreamRunOptions;
+  resolved: ResolvedStream;
+  op: string;
+  queryId: string;
+  start: number;
+  sink: EventSink;
+  cacheDir: string;
+  binHash: string;
+  effectiveBinary: string;
+  spec: DaemonRunSpec;
+  deadlineSec: number;
+  snapshotMode: boolean;
+  seen: Set<string>;        // delivered identities (within-query dedup + resume watermark)
+  resumeSeen: string[];     // identities carried in from --resume (already counted as 0)
+  runningCount: number;
+  cacheState: CacheState;
+}
+
+// Emit `meta` once (unless --no-meta). Shared by both run paths.
+function emitMeta(ctx: RunContext, pid: number | null): void {
+  if (ctx.resolved.flags.noMeta) return;
+  const meta: MetaEvent = {
+    event: 'meta', query_id: ctx.queryId, ts: now(),
+    binary: ctx.opts.binary, binary_hash: ctx.binHash, op: ctx.op,
+    cache_state: ctx.cacheState, ida_pid: pid, params: ctx.opts.params,
+  };
+  ctx.sink.push(meta);
+}
+
+// The resume cursor for any terminal/partial event: the FULL delivered-identity set
+// (prior watermark ∪ this run's deliveries), so a chain of resumes never loses items.
+function cursorFor(ctx: RunContext): string | null {
+  return encodeCursor(ctx.binHash, ctx.op, ctx.seen);
+}
+
+// ─── Single streaming pass (non-watch): the §7 meta→[status]→progress*→partial*→terminal ──
+async function runStreamOnce(ctx: RunContext): Promise<number> {
+  const { resolved, op, queryId, start, sink } = ctx;
   const minBatch = resolved.flags.minBatchSize;
   const maxMatches = resolved.flags.maxMatches;
 
-  let metaEmitted = false;
-  const emitMeta = (pid: number | null) => {
-    if (metaEmitted || resolved.flags.noMeta) return;
-    metaEmitted = true;
-    const meta: MetaEvent = {
-      event: 'meta', query_id: queryId, ts: now(),
-      binary: opts.binary, binary_hash: binHash, op,
-      cache_state: cacheState, ida_pid: pid, params: opts.params,
-    };
-    sink.push(meta);
-  };
+  let script: string;
+  try { script = composeStreamScript(op, ctx.opts.params, { resumeSeen: ctx.resumeSeen }); }
+  catch (e) {
+    return emitTerminalError(sink, queryId, 'script_crashed',
+      `failed to compose streaming script: ${e instanceof Error ? e.message : String(e)}`, 0, null);
+  }
+
+  let stopReason: CompleteReason | null = null;
+  const pending: Record<string, unknown>[] = [];  // min-batch buffer / snapshot accumulator
+  const cadence = newCadenceState();
+  // Latest phase/percent the daemon reported, surfaced by the cadence timer.
+  let lastPhase: ProgressEvent['phase'] = 'analyzing';
+  let lastPercent: number | null = null;
 
   // Flush buffered items as a partial event (respects min-batch unless forced at the end).
-  // In snapshot mode we never flush mid-stream — items accumulate and are emitted as one
-  // `snapshot` by emitSnapshot() at the end.
   const flushPending = (force: boolean) => {
-    if (snapshotMode) return;
+    if (ctx.snapshotMode) return;
     if (!pending.length) return;
     if (!force && pending.length < minBatch) return;
     const items = pending.splice(0, pending.length);
-    runningCount += items.length;
+    ctx.runningCount += items.length;
+    cadence.firstItemSeen = true;  // suppress further status/progress (§5.3)
     const ev: PartialEvent = {
       event: 'partial', query_id: queryId, ts: now(),
-      items, running_count: runningCount,
-      // SPEC-GAP: cursor (§5.4) is a real resume token in the full design; until --resume
-      // lands we emit a stable-but-opaque cursor encoding the running count.
-      cursor: makeCursor(binHash, runningCount),
+      items, running_count: ctx.runningCount, cursor: cursorFor(ctx),
     };
     sink.push(ev);
   };
 
-  // Emit the single snapshot event (§5.5) from the accumulated buffer.
   const emitSnapshot = () => {
     const items = pending.splice(0, pending.length);
-    runningCount = items.length;
+    ctx.runningCount = items.length;
     const ev: SnapshotEvent = {
       event: 'snapshot', query_id: queryId, ts: now(), items, count: items.length,
     };
     sink.push(ev);
   };
 
-  // Race-safe cooperative stop. A frame, the max-wait timer, or a signal can all ask to
-  // stop; the handle may not be assigned yet when the first request lands (it's set right
-  // after runStreamOnDaemon resolves, before any socket data is processed — but we guard
-  // regardless). If the handle isn't ready, we mark intent and apply it on assignment.
+  // Race-safe cooperative stop (handle may not exist yet when max-wait/signal fires).
   let stopRequested = false;
   let handle: StreamExecHandle | undefined;
-  const requestStop = () => {
-    stopRequested = true;
-    handle?.stop();
-  };
+  const requestStop = () => { stopRequested = true; handle?.stop(); };
 
-  // Translate one daemon frame into buffered items / progress, applying dedup + max-matches.
+  // Daemon frames: partial → buffer+dedup+max-matches; progress → update phase/percent
+  // state (the cadence TIMER decides whether to actually emit a progress event, ruling #4).
   const onFrame = (f: StreamFrame): void => {
     if (f.kind === 'progress') {
-      sink.push({
-        event: 'progress', query_id: queryId, ts: now(),
-        items_emitted: runningCount,
-        phase: (f.phase as any) ?? 'analyzing',
-        percent: f.percent ?? null, etaSec: null,
-      });
+      if (f.phase) lastPhase = f.phase as ProgressEvent['phase'];
+      lastPercent = f.percent ?? lastPercent;
       return;
     }
     if (f.kind === 'partial' && f.items) {
@@ -238,23 +312,48 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
         if (stopReason) break;
         const id = identityOf(op, item);
         if (id !== null) {
-          if (seen.has(id)) continue;  // §5.4 within-query dedup
-          seen.add(id);
+          if (ctx.seen.has(id)) continue;  // §5.4 dedup (also covers resume watermark)
+          ctx.seen.add(id);
         }
         pending.push(item);
-        if (maxMatches !== undefined && runningCount + pending.length >= maxMatches) {
+        if (maxMatches !== undefined && ctx.runningCount + pending.length >= maxMatches) {
           stopReason = 'max_matches';
           break;
         }
       }
       flushPending(false);
-      if (stopReason === 'max_matches') requestStop();  // we have enough
+      if (stopReason === 'max_matches') requestStop();
     }
   };
 
-  // ── Drive the daemon stream ──
+  // ── Cadence timer (§5.2/§5.3, ruling #4): one `status` if the first item is slower than
+  //    --status-threshold; `progress` ~every 10s while waiting; both suppressed once items
+  //    flow. Driven by a 1s tick so the gates are checked promptly without busy-waiting. ──
+  const thresholdMs = resolved.flags.statusThreshold * 1000;
+  const PROGRESS_INTERVAL_MS = 10_000;
+  const cadenceTimer = setInterval(() => {
+    const t = now();
+    if (shouldEmitStatus(cadence, start, t, thresholdMs)) {
+      cadence.statusEmitted = true;
+      const ev: StatusEvent = {
+        event: 'status', query_id: queryId, ts: t,
+        stage: phaseToStage(lastPhase), etaSec: null,
+      };
+      sink.push(ev);
+    }
+    if (shouldEmitProgress(cadence, t, PROGRESS_INTERVAL_MS)) {
+      cadence.lastProgressAt = t;
+      const ev: ProgressEvent = {
+        event: 'progress', query_id: queryId, ts: t,
+        items_emitted: ctx.runningCount, phase: lastPhase,
+        percent: lastPercent, etaSec: null,
+      };
+      sink.push(ev);
+    }
+  }, 1_000);
+  if (typeof cadenceTimer.unref === 'function') cadenceTimer.unref();
 
-  // max-wait wall-clock timer: fire a cooperative stop and record the reason.
+  // max-wait wall-clock timer.
   let maxWaitTimer: ReturnType<typeof setTimeout> | undefined;
   if (resolved.flags.maxWait !== undefined) {
     maxWaitTimer = setTimeout(() => {
@@ -263,90 +362,186 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     }, resolved.flags.maxWait * 1000);
   }
 
-  // SIGINT/SIGTERM → graceful interrupt (§5.9). Installed for the stream's duration.
-  let interrupted: 'SIGINT' | 'SIGTERM' | null = null;
-  const onSignal = (sig: 'SIGINT' | 'SIGTERM') => {
-    interrupted = sig;
-    requestStop();
-  };
-  const sigint = () => onSignal('SIGINT');
-  const sigterm = () => onSignal('SIGTERM');
-  process.on('SIGINT', sigint);
-  process.on('SIGTERM', sigterm);
+  // SIGINT/SIGTERM → graceful interrupt (§5.9).
+  let interrupted = false;
+  const onSignal = () => { interrupted = true; requestStop(); };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 
   try {
-    const started = await runStreamOnDaemon(spec, script, deadlineSec, onFrame);
+    const started = await runStreamOnDaemon(ctx.spec, script, ctx.deadlineSec, onFrame, op);
     if (started.status === 'unavailable') {
-      // We could not reach/spawn a daemon. The streaming protocol REQUIRES a live IDA, and
-      // §11.1 disallows the old one-shot path here. Surface a terminal error (never NoOutput).
       return emitTerminalError(sink, queryId, 'ida_crashed',
-        `could not start a streaming IDA session: ${started.error}`, runningCount, null);
+        `could not start a streaming IDA session: ${started.error}`, ctx.runningCount, null);
     }
-    emitMeta(started.pid);
+    emitMeta(ctx, started.pid);
     handle = started.handle;
-    // Apply any stop requested before the handle existed (max-wait/signal during startup).
     if (stopRequested) handle.stop();
 
     const { terminal, closedEarly } = await handle.done;
-
-    // Flush any remaining buffered items (min-batch is relaxed at the end, §4.1). In
-    // snapshot mode this is a no-op; the snapshot is emitted just before `complete` below.
     flushPending(true);
 
     if (interrupted) {
-      // §5.9 graceful interrupt. Best-effort cache state: the daemon persists on settle;
-      // we report the current truth. In snapshot mode no `snapshot` was emitted, so count
-      // the items we had buffered for partial_count.
-      const interruptedCount = snapshotMode ? pending.length : runningCount;
-      cacheState = classifyCache(cacheDir, binHash, effectiveBinary, opts.module);
+      const interruptedCount = ctx.snapshotMode ? pending.length : ctx.runningCount;
+      ctx.cacheState = classifyCache(ctx.cacheDir, ctx.binHash, ctx.effectiveBinary, ctx.opts.module);
       const ev: InterruptedEvent = {
         event: 'interrupted', query_id: queryId, ts: now(),
         partial_count: interruptedCount,
-        cursor: interruptedCount ? makeCursor(binHash, interruptedCount) : null,
-        cache_state: cacheState,
+        // Cursor covers everything delivered (incl. snapshot-buffered items that were not
+        // yet sent as `partial`, so resume after a snapshot-mode interrupt is exact).
+        cursor: cursorFor(ctx),
+        cache_state: ctx.cacheState,
       };
       sink.push(ev);
       return exitCodeFor('interrupted');
     }
 
-    // Terminal frame missing (daemon died mid-stream) AND no items → script_crashed (§6/§11.2.4).
     if (!terminal && closedEarly) {
       return emitTerminalError(sink, queryId, 'script_crashed',
         'streaming IDA session ended without a terminal frame (daemon crashed?)',
-        runningCount, null);
+        ctx.runningCount, null);
     }
-
     if (terminal && terminal.ok === false) {
       return emitTerminalError(sink, queryId, 'script_crashed',
-        terminal.error ?? 'streaming script failed', runningCount, null);
+        terminal.error ?? 'streaming script failed', ctx.runningCount, null);
     }
 
-    // Snapshot mode: emit the single snapshot now (§5.5), right before complete.
-    if (snapshotMode) emitSnapshot();
+    if (ctx.snapshotMode) emitSnapshot();
 
-    // Successful completion. Reason precedence: a client-side stop (max_matches/max_wait)
-    // wins; otherwise honor the script's own reason (natural / db_settled).
-    const reason: CompleteReason = stopReason
+    // §5.7 reason precedence: client-side stop wins; else honor the script's own reason.
+    // `cursor_exhausted` when --resume found nothing new (the watermark already covered
+    // everything currently in the DB).
+    let reason: CompleteReason = stopReason
       ?? (terminal?.reason as CompleteReason | undefined)
       ?? 'natural';
-    cacheState = classifyCache(cacheDir, binHash, effectiveBinary, opts.module);
+    if (ctx.resumeSeen.length && ctx.runningCount === 0 && stopReason === null) {
+      reason = 'cursor_exhausted';
+    }
+    ctx.cacheState = classifyCache(ctx.cacheDir, ctx.binHash, ctx.effectiveBinary, ctx.opts.module);
     const complete: CompleteEvent = {
       event: 'complete', query_id: queryId, ts: now(),
-      count: runningCount, reason,
-      durationSec: elapsed(start),
-      cursor: runningCount ? makeCursor(binHash, runningCount) : null,
-      cache_state: cacheState,
+      count: ctx.runningCount, reason, durationSec: elapsed(start),
+      cursor: cursorFor(ctx), cache_state: ctx.cacheState,
     };
     sink.push(complete);
     return exitCodeFor('complete');
   } catch (e) {
     flushPending(true);
     return emitTerminalError(sink, queryId, 'ida_crashed',
-      `streaming failed: ${e instanceof Error ? e.message : String(e)}`, runningCount, null);
+      `streaming failed: ${e instanceof Error ? e.message : String(e)}`, ctx.runningCount, null);
+  } finally {
+    clearInterval(cadenceTimer);
+    if (maxWaitTimer) clearTimeout(maxWaitTimer);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+  }
+}
+
+// ─── --watch mode (§5.6): snapshot, then poll+diff on an interval, emitting deltas ──────
+//
+// Implementation is poll-based, not hook-based: we re-run the op as a single snapshot pass
+// against the live (still-warming or settled) database every WATCH_POLL_MS, diff by identity
+// against the prior result set (diffSnapshots), and emit a `delta{added,removed}` whenever
+// something changed. This is the "pragmatic implementation" the scope calls for; its
+// limitation (vs. a true ida_idp mutation hook) is documented in the report: latency is the
+// poll interval, and `mutation` is a best-effort guess from the shape of the change, not the
+// actual IDA event that caused it. Runs until SIGINT/SIGTERM or --max-wait.
+async function runWatch(ctx: RunContext): Promise<number> {
+  const { resolved, op, queryId, start, sink } = ctx;
+  const WATCH_POLL_MS = 2_000;
+
+  // Run one snapshot pass against the daemon and return the full (deduped-by-identity)
+  // result set. Used for the initial snapshot AND each poll. A short per-pass deadline keeps
+  // each poll responsive on a still-warming DB instead of blocking the whole budget.
+  const passDeadline = Math.min(ctx.deadlineSec, 10);
+  const runPass = async (): Promise<{ items: Record<string, unknown>[]; pid: number } | { error: string }> => {
+    let script: string;
+    try { script = composeStreamScript(op, ctx.opts.params, { watchPass: true }); }
+    catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+    const collected: Record<string, unknown>[] = [];
+    const localSeen = new Set<string>();
+    const onFrame = (f: StreamFrame): void => {
+      if (f.kind === 'partial' && f.items) {
+        for (const item of f.items) {
+          const id = identityOf(op, item);
+          if (id !== null) { if (localSeen.has(id)) continue; localSeen.add(id); }
+          collected.push(item);
+        }
+      }
+    };
+    const started = await runStreamOnDaemon(ctx.spec, script, passDeadline, onFrame, op);
+    if (started.status === 'unavailable') return { error: started.error };
+    const { terminal } = await started.handle.done;
+    if (terminal && terminal.ok === false) return { error: terminal.error ?? 'watch pass failed' };
+    return { items: collected, pid: started.pid };
+  };
+
+  // Stop control.
+  let stop = false;
+  let stopReason: CompleteReason | null = null;
+  const onSignal = () => { stop = true; };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+  let maxWaitTimer: ReturnType<typeof setTimeout> | undefined;
+  if (resolved.flags.maxWait !== undefined) {
+    maxWaitTimer = setTimeout(() => { stop = true; stopReason = 'max_wait'; },
+      resolved.flags.maxWait * 1000);
+  }
+
+  try {
+    // Initial snapshot (§5.6: "after the initial snapshot is delivered, keep subscribed").
+    const first = await runPass();
+    if ('error' in first) {
+      return emitTerminalError(sink, queryId, 'ida_crashed',
+        `could not start a streaming IDA session: ${first.error}`, 0, null);
+    }
+    emitMeta(ctx, first.pid);
+    let prior = first.items;
+    for (const it of prior) { const id = identityOf(op, it); if (id !== null) ctx.seen.add(id); }
+    ctx.runningCount = prior.length;
+    sink.push({ event: 'snapshot', query_id: queryId, ts: now(), items: prior, count: prior.length } as SnapshotEvent);
+
+    // Poll loop: re-run, diff, emit deltas until stopped.
+    while (!stop) {
+      await sleep(WATCH_POLL_MS);
+      if (stop) break;
+      const next = await runPass();
+      if ('error' in next) continue;  // transient pass failure: try again next tick
+      const { added, removed } = diffSnapshots(op, prior, next.items);
+      if (added.length || removed.length) {
+        for (const it of added) { const id = identityOf(op, it); if (id !== null) ctx.seen.add(id); }
+        ctx.runningCount += added.length - removed.length;
+        const ev: DeltaEvent = {
+          event: 'delta', query_id: queryId, ts: now(),
+          added, removed, mutation: guessMutation(added.length, removed.length),
+        };
+        sink.push(ev);
+      }
+      prior = next.items;
+    }
+
+    // §7 watch terminal: --max-wait → complete; SIGINT/SIGTERM → interrupted.
+    ctx.cacheState = classifyCache(ctx.cacheDir, ctx.binHash, ctx.effectiveBinary, ctx.opts.module);
+    if (stopReason === 'max_wait') {
+      sink.push({
+        event: 'complete', query_id: queryId, ts: now(),
+        count: ctx.runningCount, reason: 'max_wait', durationSec: elapsed(start),
+        cursor: cursorFor(ctx), cache_state: ctx.cacheState,
+      } as CompleteEvent);
+      return exitCodeFor('complete');
+    }
+    sink.push({
+      event: 'interrupted', query_id: queryId, ts: now(),
+      partial_count: ctx.runningCount, cursor: cursorFor(ctx), cache_state: ctx.cacheState,
+    } as InterruptedEvent);
+    return exitCodeFor('interrupted');
+  } catch (e) {
+    return emitTerminalError(sink, queryId, 'ida_crashed',
+      `watch failed: ${e instanceof Error ? e.message : String(e)}`, ctx.runningCount, null);
   } finally {
     if (maxWaitTimer) clearTimeout(maxWaitTimer);
-    process.removeListener('SIGINT', sigint);
-    process.removeListener('SIGTERM', sigterm);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
   }
 }
 
@@ -370,11 +565,31 @@ function emitTerminalError(
   return exitCodeFor('error', kind);
 }
 
-// Opaque resume cursor (§5.4/§5.7). Until --resume lands this is a forward-compatible
-// placeholder: a versioned base64 of {h: binHash, n: count}. Documented as deferred.
-function makeCursor(binHash: string, count: number): string {
-  const payload = Buffer.from(JSON.stringify({ h: binHash, n: count }), 'utf8').toString('base64');
-  return `v1-${payload}`;
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Map a progress `phase` to the §5.2 `status.stage` enum. The progress vocabulary has two
+// extra values (`idle`, `done`) with no status equivalent; collapse them to `analyzing`
+// since `status` only fires while still waiting for the first item.
+function phaseToStage(phase: ProgressEvent['phase']): StatusEvent['stage'] {
+  switch (phase) {
+    case 'swift_metadata': return 'swift_metadata';
+    case 'indexing':       return 'indexing';
+    case 'decompiling':    return 'decompiling';
+    default:               return 'analyzing';
+  }
+}
+
+// Best-effort map of a poll-diff shape to the §5.6 `mutation` enum. We can't see the real
+// IDA event that caused the change (poll-based watch), so we infer from the diff: pure
+// additions look like new functions/data; removals like renames/removals; a mix like
+// reanalysis. Documented as approximate in the report.
+function guessMutation(added: number, removed: number): DeltaEvent['mutation'] {
+  if (added > 0 && removed === 0) return 'functions_added';
+  if (added === 0 && removed > 0) return 'functions_removed';
+  if (added > 0 && removed > 0) return 'functions_renamed';  // identity churn ≈ rename
+  return 'reanalysis';
 }
 
 function resolveBackendName(requested: 'auto' | BackendName, config: Config): BackendName {

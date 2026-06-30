@@ -33,6 +33,18 @@ SOCK_PATH = os.environ.get('RE_DAEMON_SOCKET', '')
 IDLE_SEC = float(os.environ.get('RE_DAEMON_IDLE', '1800') or '1800')
 SAVE_IDB = os.environ.get('RE_DAEMON_SAVE_IDB', '')
 
+# Live streaming-query telemetry for `re status` (issue #13 criterion #2). A streaming
+# exec updates this; `ping` reports it so `re status <binary>` can surface items-emitted
+# and a rough ETA WITHOUT consuming the query. Reset when a stream ends.
+_STREAM_STATS = {
+    'active': False,
+    'op': None,
+    'started': 0.0,
+    'items': 0,
+    'phase': None,
+    'deadline': 0.0,   # absolute epoch deadline of the in-flight stream, for ETA
+}
+
 
 def _log(msg):
     # Goes to IDA's -L log, which the client tails for startup progress.
@@ -111,14 +123,23 @@ def _stream_exec(conn, req):
 
     state = {'count': 0, 'stopped': False, 'reason': 'natural', 'settled': False}
 
+    # Publish live telemetry for `re status`. A --watch query re-runs many short passes; we
+    # only mark a pass "active" so status sees the daemon is busy, and accumulate items.
+    _STREAM_STATS.update({
+        'active': True, 'op': req.get('op'), 'started': time.time(),
+        'items': 0, 'phase': None, 'deadline': time.time() + deadline_sec,
+    })
+
     def _emit(items):
         if not items:
             return
         state['count'] += len(items)
+        _STREAM_STATS['items'] = state['count']
         _send_frame(conn, {'id': rid, 'kind': 'partial', 'items': items,
                            'count': state['count']})
 
     def _progress(phase=None, percent=None):
+        _STREAM_STATS['phase'] = phase
         _send_frame(conn, {'id': rid, 'kind': 'progress',
                            'phase': phase, 'percent': percent})
 
@@ -166,6 +187,8 @@ def _stream_exec(conn, req):
         _send_frame(conn, {'id': rid, 'kind': 'final', 'final': True, 'ok': False,
                            'count': state['count'],
                            'error': '%s: %s' % (type(e).__name__, e)})
+    finally:
+        _STREAM_STATS['active'] = False
 
 
 def _handle(req):
@@ -178,10 +201,33 @@ def _handle(req):
         return {'id': rid, 'ok': True}, True
 
     if kind == 'ping':
+        # Surface live streaming telemetry for `re status` (issue #13 #2): items emitted so
+        # far, the coarse phase, elapsed, and a rough ETA = remaining budget to the stream's
+        # deadline (honest "time until we stop waiting", since IDA gives no true completion
+        # ETA). All null/absent when no stream is in flight.
+        stream = None
+        if _STREAM_STATS.get('active'):
+            now_t = time.time()
+            try:
+                settled = ida_auto.auto_is_ok()
+            except Exception:
+                settled = None
+            eta = None
+            if not settled and _STREAM_STATS.get('deadline'):
+                eta = max(0, int(round(_STREAM_STATS['deadline'] - now_t)))
+            stream = {
+                'op': _STREAM_STATS.get('op'),
+                'itemsEmitted': _STREAM_STATS.get('items', 0),
+                'phase': _STREAM_STATS.get('phase'),
+                'elapsedSec': int(round(now_t - _STREAM_STATS.get('started', now_t))),
+                'etaSec': 0 if settled else eta,
+                'settled': settled,
+            }
         return {'id': rid, 'ok': True, 'meta': {
             'pid': os.getpid(),
             'kernel': idaapi.get_kernel_version(),
             'input': idc.get_input_file_path(),
+            'stream': stream,
         }}, False
 
     if kind == 'exec':

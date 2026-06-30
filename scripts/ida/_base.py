@@ -52,3 +52,108 @@ def _re_exit(code=0):
     if _os_base.environ.get('RE_DAEMON'):
         return
     _idc.qexit(code)
+
+
+# ─── Shared streaming driver (issue #13 phase 2) ────────────────────────────────────
+#
+# Factored out of the per-op *.stream.py bodies so the dedup / batching / deadline /
+# should_stop / incremental-rescan logic lives in ONE place. A streaming op defines a
+# `produce()` generator that yields (identity, row) pairs for the CURRENT database state;
+# this driver handles everything else and is the piece that makes cold huge-binary
+# streaming actually work (§11.2.1): after the first pass it keeps re-scanning as analysis
+# discovers more items, emitting newly-appeared rows as additional `partial` events.
+#
+# It only runs inside the daemon's stream_exec, which injects _re_emit / _re_should_stop /
+# _re_progress / _re_deadline_wait into the namespace; we read those from globals() so this
+# file still imports cleanly in the one-shot path (where they're absent).
+
+def _re_stream_run(produce, batch_max=200):
+    g = globals()
+    emit = g.get('_re_emit')
+    should_stop = g.get('_re_should_stop', lambda: False)
+    progress = g.get('_re_progress', lambda *a, **k: None)
+    state = g.get('_re_stream_state', {})
+    resume_seen = g.get('_RE_RESUME_SEEN', set())
+    watch_pass = bool(g.get('_RE_WATCH_PASS', False))
+    deadline_total = float(g.get('_RE_STREAM_DEADLINE', 600) or 600)
+
+    if emit is None:
+        raise RuntimeError('_re_stream_run requires the daemon stream_exec helpers')
+
+    # `seen` starts seeded with the resume watermark so previously-delivered identities are
+    # never re-emitted (server-side dedup, §5.4 / acceptance #4). Watch passes start empty
+    # of resume state — the runner diffs full snapshots itself.
+    seen = set() if watch_pass else set(resume_seen)
+
+    def _scan_once():
+        """Emit every not-yet-seen (identity, row) in the current DB. Returns the count of
+        newly-emitted rows so the caller can tell whether progress is still being made."""
+        batch = []
+        new_count = 0
+
+        def flush():
+            if batch:
+                emit(list(batch))
+                del batch[:]
+
+        for ident, row in produce():
+            if ident is not None:
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            batch.append(row)
+            new_count += 1
+            if len(batch) >= batch_max:
+                flush()
+                if should_stop():
+                    state['reason'] = 'max_matches'
+                    return new_count, True
+        flush()
+        return new_count, should_stop()
+
+    # ── Watch pass: a single snapshot scan, no deadline wait, no incremental rescan. ──
+    if watch_pass:
+        _scan_once()
+        state['reason'] = 'natural'
+        return
+
+    # ── Normal streaming: first scan against current (possibly partial) state, then keep
+    #    rescanning as analysis settles so late-discovered items stream too (§11.2.1). ──
+    _, stopped = _scan_once()
+    if stopped:
+        return
+
+    # Incremental loop: wait for the auto-analysis queue to drain a bit (auto_is_ok), or for
+    # a short interval, then rescan. We use the auto-queue-drained signal as the "more may
+    # have appeared" trigger (equivalent to an auto_queue_empty hook, but pull-based so it
+    # composes with the deadline/stop checks without holding IDA's UI hook lock). Loop ends
+    # when the deadline passes OR analysis fully settles AND a rescan finds nothing new.
+    import time as _t
+    deadline = _t.time() + deadline_total
+    idle_rescans = 0
+    while _t.time() < deadline:
+        if should_stop():
+            state['reason'] = 'max_matches'
+            return
+        try:
+            settled = _ida_auto.auto_is_ok()
+        except Exception:
+            settled = True
+        # Give analysis a slice of time to surface more items before rescanning.
+        _t.sleep(1.0)
+        new_count, stopped = _scan_once()
+        if stopped:
+            return
+        progress('done' if settled else 'analyzing', 100 if settled else None)
+        if settled:
+            # Analysis is done. One clean rescan with nothing new ⇒ the result set is final.
+            if new_count == 0:
+                idle_rescans += 1
+                if idle_rescans >= 1:
+                    state['settled'] = True
+                    state['reason'] = 'db_settled'
+                    return
+            else:
+                idle_rescans = 0
+    # Hit the deadline with analysis still going: stream is "natural" (more may exist later).
+    state['reason'] = 'natural'
