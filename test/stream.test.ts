@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import {
   parseStreamFlags, validateStream, ValidateError, resolveFormat, isBounded,
   projectItem, identityOf, serializeEvent, EventSink, hasStreamingFlags,
+  encodeCursor, decodeCursor, CursorError, diffSnapshots,
+  newCadenceState, shouldEmitStatus, shouldEmitProgress,
   type StreamEvent, type PartialEvent, type CompleteEvent, type MetaEvent,
 } from '../src/stream.ts';
 import { exitCodeFor } from '../src/stream_runner.ts';
@@ -139,9 +141,28 @@ test('validateStream: known --fields keys pass', () => {
   assert.doesNotThrow(() => validateStream('functions', f, false));
 });
 
-test('validateStream: --resume and --watch error as deferred', () => {
-  assert.throws(() => validateStream('functions', parseStreamFlags({ resume: 'v1-x' }), false), ValidateError);
-  assert.throws(() => validateStream('functions', parseStreamFlags({ watch: true }), false), ValidateError);
+test('validateStream: --resume and --watch are now accepted (phase 2)', () => {
+  // A well-formed cursor envelope passes validate (the real decode happens in the runner,
+  // which knows the binary hash). --watch on a streamable op is enabled.
+  assert.doesNotThrow(() => validateStream('functions', parseStreamFlags({ resume: 'v2-abc' }), false));
+  const w = validateStream('functions', parseStreamFlags({ watch: true }), false);
+  assert.equal(w.enabled, true);
+});
+
+test('validateStream: malformed --resume cursor envelope errors before IDA', () => {
+  assert.throws(() => validateStream('functions', parseStreamFlags({ resume: 'not-a-cursor' }), false), ValidateError);
+});
+
+test('validateStream: --watch + --resume conflict errors', () => {
+  assert.throws(
+    () => validateStream('functions', parseStreamFlags({ watch: true, resume: 'v2-abc' }), false),
+    ValidateError);
+});
+
+test('validateStream: --watch still rejected on non-streamable ops', () => {
+  for (const op of ['info', 'imports', 'decompile']) {
+    assert.throws(() => validateStream(op, parseStreamFlags({ watch: true }), false), ValidateError);
+  }
 });
 
 test('validateStream: streamable op with --stream enables streaming', () => {
@@ -296,4 +317,118 @@ test('exitCodeFor: other error kinds ⇒ 3', () => {
   assert.equal(exitCodeFor('error', 'script_crashed'), 3);
   assert.equal(exitCodeFor('error', 'ida_crashed'), 3);
   assert.equal(exitCodeFor('error', 'out_of_memory'), 3);
+});
+
+// ─── status-threshold flag (§5.2) ────────────────────────────────────────────────
+
+test('parseStreamFlags: --status-threshold defaults to 5, parses int, rejects bad', () => {
+  assert.equal(parseStreamFlags({}).statusThreshold, 5);
+  assert.equal(parseStreamFlags({ 'status-threshold': '12' }).statusThreshold, 12);
+  assert.throws(() => parseStreamFlags({ 'status-threshold': '0' }), ValidateError);
+  assert.throws(() => parseStreamFlags({ 'status-threshold': 'soon' }), ValidateError);
+});
+
+// ─── resume cursor encode/decode + server-side dedup (§5.4/§5.7/§9; acceptance #4) ──
+
+test('encodeCursor: null for empty delivery, dedups + sorts identities', () => {
+  assert.equal(encodeCursor('hash', 'functions', []), null);
+  const c = encodeCursor('hash', 'functions', ['0x3', '0x1', '0x1', '0x2']);
+  assert.ok(c && c.startsWith('v2-'));
+  // Round-trip recovers the deduped sorted watermark.
+  const p = decodeCursor(c!, 'hash', 'functions');
+  assert.deepEqual(p.w, ['0x1', '0x2', '0x3']);
+  assert.equal(p.h, 'hash');
+  assert.equal(p.op, 'functions');
+});
+
+test('encodeCursor → decodeCursor round-trips arbitrary identity strings (base64url safe)', () => {
+  // Identities like xrefs `from` are hex, but string `value`-ish identities could contain
+  // +,/,= or unicode; ensure the encoding survives them as a bare CLI arg.
+  const ids = ['a+b/c=', 'naïve', '0xFFEE', 'tab\tinside'];
+  const c = encodeCursor('h', 'strings', ids)!;
+  assert.equal(/^[A-Za-z0-9._-]+$/.test(c), true);  // safe to pass unquoted
+  assert.deepEqual(decodeCursor(c, 'h', 'strings').w.sort(), [...ids].sort());
+});
+
+test('decodeCursor: rejects wrong binary hash, wrong op, malformed, and v1 placeholder', () => {
+  const c = encodeCursor('hashA', 'functions', ['0x1'])!;
+  assert.throws(() => decodeCursor(c, 'hashB', 'functions'), CursorError);   // binary mismatch (§9)
+  assert.throws(() => decodeCursor(c, 'hashA', 'strings'), CursorError);     // op mismatch
+  assert.throws(() => decodeCursor('garbage', 'hashA', 'functions'), CursorError);
+  assert.throws(() => decodeCursor('v2-!!!notbase64', 'hashA', 'functions'), CursorError);
+  // A v1 (phase-1 placeholder) cursor has no watermark → refuse loudly, don't silently
+  // re-deliver (acceptance #4 demands real dedup).
+  assert.throws(() => decodeCursor('v1-eyJoIjoiaGFzaEEiLCJuIjoxfQ', 'hashA', 'functions'), CursorError);
+});
+
+test('resume dedup: seeding `seen` with the watermark skips already-delivered identities', () => {
+  // This is the deterministic stand-in for a mid-analysis SIGINT → --resume cycle: the prior
+  // run delivered {0x1,0x2}; the resume seeds those and a fresh scan of {0x1,0x2,0x3,0x4}
+  // yields only the new {0x3,0x4}. (Mirrors the runner's seed-from-cursor + dedup logic.)
+  const priorCursor = encodeCursor('h', 'functions', ['0x1', '0x2'])!;
+  const watermark = decodeCursor(priorCursor, 'h', 'functions').w;
+  const seen = new Set<string>(watermark);
+  const freshScan = [{ address: '0x1' }, { address: '0x2' }, { address: '0x3' }, { address: '0x4' }];
+  const delivered: string[] = [];
+  for (const item of freshScan) {
+    const id = identityOf('functions', item)!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    delivered.push(id);
+  }
+  assert.deepEqual(delivered, ['0x3', '0x4']);
+  // The next cursor covers the union, so a chain of resumes never loses items.
+  assert.deepEqual(decodeCursor(encodeCursor('h', 'functions', seen)!, 'h', 'functions').w,
+    ['0x1', '0x2', '0x3', '0x4']);
+});
+
+// ─── snapshot diffing for --watch deltas (§5.6) ───────────────────────────────────
+
+test('diffSnapshots: pure added/removed by identity', () => {
+  const prior = [{ address: '0x1', name: 'a' }, { address: '0x2', name: 'b' }];
+  const next = [{ address: '0x2', name: 'b' }, { address: '0x3', name: 'c' }];
+  const d = diffSnapshots('functions', prior, next);
+  assert.deepEqual(d.added.map((i) => i.address), ['0x3']);
+  assert.deepEqual(d.removed.map((i) => i.address), ['0x1']);
+});
+
+test('diffSnapshots: no change ⇒ empty added/removed', () => {
+  const set = [{ address: '0x1' }, { address: '0x2' }];
+  const d = diffSnapshots('functions', set, [...set]);
+  assert.deepEqual(d.added, []);
+  assert.deepEqual(d.removed, []);
+});
+
+test('diffSnapshots: a rename (identity addr changes) is removed(old)+added(new), per §5.6', () => {
+  // xrefs identity is `from`; an item whose identity changed looks like remove+add.
+  const prior = [{ from: '0xa', to: '0xt' }];
+  const next = [{ from: '0xb', to: '0xt' }];
+  const d = diffSnapshots('xrefs', prior, next);
+  assert.deepEqual(d.added.map((i) => i.from), ['0xb']);
+  assert.deepEqual(d.removed.map((i) => i.from), ['0xa']);
+});
+
+// ─── periodic status/progress cadence gating (§5.2/§5.3; ruling #4) ────────────────
+
+test('shouldEmitStatus: fires once, only before first item, only past threshold', () => {
+  const st = newCadenceState();
+  const thresholdMs = 5000;
+  assert.equal(shouldEmitStatus(st, 0, 4999, thresholdMs), false);  // under threshold
+  assert.equal(shouldEmitStatus(st, 0, 5000, thresholdMs), true);   // at threshold
+  st.statusEmitted = true;
+  assert.equal(shouldEmitStatus(st, 0, 9000, thresholdMs), false);  // already emitted
+  const st2 = newCadenceState();
+  st2.firstItemSeen = true;
+  assert.equal(shouldEmitStatus(st2, 0, 9000, thresholdMs), false); // items already flowed
+});
+
+test('shouldEmitProgress: every interval while waiting, suppressed once items flow', () => {
+  const st = newCadenceState();   // lastProgressAt=0
+  assert.equal(shouldEmitProgress(st, 9999, 10_000), false);
+  assert.equal(shouldEmitProgress(st, 10_000, 10_000), true);
+  st.lastProgressAt = 10_000;
+  assert.equal(shouldEmitProgress(st, 19_999, 10_000), false);
+  assert.equal(shouldEmitProgress(st, 20_000, 10_000), true);
+  st.firstItemSeen = true;
+  assert.equal(shouldEmitProgress(st, 999_999, 10_000), false);   // suppressed after items
 });

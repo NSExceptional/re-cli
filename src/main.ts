@@ -7,7 +7,7 @@ import { join, basename } from 'node:path';
 import { loadConfig, CONFIG_FILE } from './config.ts';
 import { run } from './runner.ts';
 import type { DaemonMode } from './runner.ts';
-import { listDaemons, stopAllDaemons, stopDaemonsForBinary, daemonFor, daemonKey } from './daemon.ts';
+import { listDaemons, stopAllDaemons, stopDaemonsForBinary, daemonFor, daemonStreamStats, daemonKey } from './daemon.ts';
 import { analysisLockHolder } from './lock.ts';
 import { phaseFromLog } from './progress.ts';
 import { expandHome, binaryHash, elapsed } from './util.ts';
@@ -623,11 +623,24 @@ async function cmdStatus(
   const state = ready ? 'ready' : warming ? 'warming' : 'none';
   const now = Date.now();
 
-  // Issue #13 criterion #2: surface the in-flight analysis phase (coarse, from the daemon
-  // log tail). NOTE: items-emitted-so-far and ETA require per-query daemon instrumentation
-  // and are deferred — see report. `phase` is null when nothing is warming or no log yet.
+  // Issue #13 criterion #2: surface the in-flight analysis phase + items-emitted + ETA.
+  // Prefer LIVE daemon telemetry (a streaming query in flight reports exact counters via
+  // `ping`, without consuming the query); fall back to the coarse log-tail phase when the
+  // daemon is up but not actively streaming.
   let phase: string | null = null;
-  if (binHash && warming) {
+  let streamItems: number | null = null;
+  let streamEta: number | null = null;
+  let streamOp: string | null = null;
+  if (binHash && daemon && daemon.ready) {
+    const stats = await daemonStreamStats(cacheDir, backend, binHash);
+    if (stats) {
+      phase = stats.phase ?? phase;
+      streamItems = stats.itemsEmitted;
+      streamEta = stats.etaSec;
+      streamOp = stats.op;
+    }
+  }
+  if (phase === null && binHash && warming) {
     const daemonLog = join(expandHome(cacheDir), 'daemons', daemonKey(backend, binHash), 'daemon.log');
     phase = phaseFromLog(daemonLog) ?? null;
   }
@@ -642,10 +655,11 @@ async function cmdStatus(
           inFlight: true, pid: holder.pid || null,
           elapsedSec: holder.startedAt ? Math.round((now - holder.startedAt) / 1000) : null,
           phase,
-          // Deferred (issue #13 #2): real per-query counters need daemon-side tracking.
-          itemsEmitted: null as number | null, etaSec: null as number | null,
+          // Live per-query counters from the streaming daemon (issue #13 #2), null if no
+          // streaming query is in flight.
+          itemsEmitted: streamItems, etaSec: streamEta, op: streamOp,
         }
-      : { inFlight: false, phase },
+      : { inFlight: false, phase, itemsEmitted: streamItems, etaSec: streamEta, op: streamOp },
     database,
   };
 
@@ -653,6 +667,10 @@ async function cmdStatus(
     console.log(`${binary}${arch ? ` (${arch})` : ''} — ${state.toUpperCase()}`);
     if (data.daemon.running) console.log(`  daemon     pid ${daemon!.pid}, up ${data.daemon.uptimeSec}s${daemon!.ready ? '' : ' (warming)'}${phase ? ` · ${phase}` : ''}`);
     if (holder) console.log(`  analyzing  pid ${holder.pid || '?'}, ${data.analysis.elapsedSec ?? '?'}s elapsed${phase ? ` · ${phase}` : ''}`);
+    if (streamItems !== null) {
+      const eta = streamEta === null ? '?' : `${streamEta}s`;
+      console.log(`  streaming  ${streamOp ?? 'query'} · ${streamItems} items emitted · ETA ${eta}`);
+    }
     if (idbExists) console.log(`  database   ${database.sizeMb} MB, built ${database.mtime}`);
     if (state === 'none') console.log('  (no daemon, no analysis in flight, no cached database)');
   } else {

@@ -214,6 +214,7 @@ export function streamExecOnDaemon(
   deadlineSec: number,
   onFrame: (f: StreamFrame) => void,
   timeoutMs: number,
+  op?: string,
 ): StreamExecHandle {
   let resolveDone!: (v: { terminal: StreamFrame | null; closedEarly: boolean }) => void;
   let rejectDone!: (e: unknown) => void;
@@ -241,7 +242,7 @@ export function streamExecOnDaemon(
   };
 
   sock.once('connect', () => {
-    const req = { id: 1, type: 'stream_exec', script: scriptText, deadline: deadlineSec };
+    const req = { id: 1, type: 'stream_exec', script: scriptText, deadline: deadlineSec, op };
     const body = Buffer.from(JSON.stringify(req), 'utf8');
     const hdr = Buffer.alloc(4);
     hdr.writeUInt32BE(body.length, 0);
@@ -441,6 +442,35 @@ export async function daemonFor(
   return { pid: meta.pid, startedAt: meta.startedAt, ready: await canConnect(meta.socketPath) };
 }
 
+// Live streaming telemetry for `re status` (issue #13 criterion #2): items emitted so far,
+// phase, and a rough ETA for any in-flight streaming query, fetched via the daemon's `ping`
+// WITHOUT consuming the query. Returns null when no daemon is reachable or none is streaming.
+export interface DaemonStreamStats {
+  op: string | null;
+  itemsEmitted: number;
+  phase: string | null;
+  elapsedSec: number;
+  etaSec: number | null;
+  settled: boolean | null;
+}
+export async function daemonStreamStats(
+  cacheDir: string,
+  backend: BackendName,
+  binHash: string,
+  module?: string,
+): Promise<DaemonStreamStats | null> {
+  const dir = registryDir(cacheDir, daemonKey(backend, binHash, module));
+  const meta = readMeta(dir);
+  if (!meta || !pidAlive(meta.pid)) return null;
+  try {
+    const r = await sendRequest(meta.socketPath, { id: 1, type: 'ping' }, 2000);
+    const s = r?.meta?.stream;
+    return s ? (s as DaemonStreamStats) : null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Public entry: run one query through a (possibly auto-started) daemon ────────
 
 export async function runOnDaemon(spec: DaemonRunSpec, scriptText: string): Promise<DaemonOutcome> {
@@ -470,6 +500,7 @@ export async function runStreamOnDaemon(
   scriptText: string,
   deadlineSec: number,
   onFrame: (f: StreamFrame) => void,
+  op?: string,
 ): Promise<
   | { status: 'streaming'; pid: number; handle: StreamExecHandle }
   | { status: 'unavailable'; error: string }
@@ -484,7 +515,7 @@ export async function runStreamOnDaemon(
 
   const meta = readMeta(dir);
   const pid = meta?.pid ?? -1;
-  const handle = streamExecOnDaemon(socketPath, scriptText, deadlineSec, onFrame, spec.timeoutMs);
+  const handle = streamExecOnDaemon(socketPath, scriptText, deadlineSec, onFrame, spec.timeoutMs, op);
   return { status: 'streaming', pid, handle };
 }
 
