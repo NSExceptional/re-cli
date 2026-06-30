@@ -51,7 +51,6 @@ function parseArgs(argv: string[]): ParsedArgs {
       positional.push(...argv.slice(i + 1));
       break;
     }
-    if (arg === '-f') { flags['force'] = true; continue; }  // -f / --force: allow destructive overwrite
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
       const eq = key.indexOf('=');
@@ -197,7 +196,7 @@ function globalRunOpts(flags: Record<string, string | boolean>, config: ReturnTy
     backend: (flags['backend'] as 'auto' | BackendName | undefined) ?? 'auto',
     noCache:    flags['cache']    === false,
     noIdbCache: flags['idb-cache'] === false,
-    force:      flags['force']    === true,
+    force:      flags['destructively-overwrite-existing'] === true,
     timeout:    Number(flags['timeout']) || config.defaults.timeout,
     format:     defaultFormat(flags),
     daemonMode: daemonModeFromFlags(flags),
@@ -846,8 +845,10 @@ Global flags:
   --timeout    seconds               Optional hard cap (default: none — runs to completion)
   --no-cache                         Skip result cache
   --no-idb-cache                     Force re-analysis even if .i64 exists (forces one-shot)
-  -f, --force                        Allow a fresh analysis to OVERWRITE an existing cached
-                                     database (otherwise re refuses, to protect prior analysis)
+  --destructively-overwrite-existing Allow a fresh analysis to overwrite an existing cached
+                                     database (re refuses by default, to protect prior analysis).
+                                     A database over 2 GB is first backed up to a .<ts>.bak file,
+                                     so even this is non-destructive.
   --daemon     auto | on | off       Warm-database daemon (default: auto). auto starts one
                                      for binaries >= daemon.autostartMinMb; on forces it;
                                      off (or --no-daemon) always runs one-shot
@@ -979,7 +980,7 @@ async function main(): Promise<void> {
         config,
         backend: backend as 'auto' | BackendName,
         timeout,
-        force: flags['force'] === true,
+        force: flags['destructively-overwrite-existing'] === true,
       });
       process.exit(code);
     }
@@ -993,7 +994,7 @@ async function main(): Promise<void> {
     config,
     noCache,
     noIdbCache,
-    force: flags['force'] === true,
+    force: flags['destructively-overwrite-existing'] === true,
     timeout,
     arch: flags['arch'] as string | undefined,
     daemonMode,

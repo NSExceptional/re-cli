@@ -1,7 +1,29 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { statSync, renameSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
+
+// A cached database at or above this size is backed up (not destroyed) before a forced
+// overwrite — a big .i64 represents hours of analysis. Small ones are cheap to rebuild.
+export const IDB_BACKUP_THRESHOLD_BYTES = 2 * 1024 ** 3;  // 2 GB
+
+// Preserve a LARGE existing database before a forced overwrite destroys it, by renaming it to
+// `<path>.<unix-ts>.bak` (a same-directory move — instant, no multi-GB copy). Returns the backup
+// path if one was made; null if the file is absent or below the threshold (overwrite in place).
+// THROWS if a large database exists but couldn't be moved — the caller must then refuse the
+// overwrite rather than destroy hours of work without a backup.
+export function backupLargeIdb(idbPath: string, thresholdBytes = IDB_BACKUP_THRESHOLD_BYTES): string | null {
+  let size: number;
+  try {
+    size = statSync(idbPath).size;
+  } catch {
+    return null;  // nothing there to back up
+  }
+  if (size <= thresholdBytes) return null;  // small — safe to overwrite without a backup
+  const backup = `${idbPath}.${Math.floor(Date.now() / 1000)}.bak`;
+  renameSync(idbPath, backup);
+  return backup;
+}
 
 export function binaryHash(filePath: string): string {
   const stat = statSync(filePath);

@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import type { BackendName } from './backends/types.ts';
 import type { Config } from './config.ts';
 import type { REResult } from './result.ts';
-import { binaryHash, resultKey, randomId, elapsed, expandHome, machoArchs } from './util.ts';
+import { binaryHash, resultKey, randomId, elapsed, expandHome, machoArchs, backupLargeIdb } from './util.ts';
 import {
   hasIdb, idbPath, idbCacheDir, ensureIdbDir,
   hasHop, hopPath,
@@ -361,11 +361,26 @@ export async function run(opts: RunOptions): Promise<REResult> {
   // (or a stale/forced path) can trigger fresh analysis while a COMPLETE .i64 is present, and
   // silently clobber hours of analysis. Refuse unless --force. (Cold binaries — no .i64 — pass
   // straight through; this only fires when a finished database is about to be overwritten.)
-  if (backend === 'ida' && !useIdb && !opts.force && hasIdb(cacheDir, binHash, opts.module)) {
-    return mkError(opts, binHash, backend, elapsed(start), 'AnalysisExists',
-      `Refusing to overwrite the existing analysis at ${idbPath(cacheDir, binHash, opts.module)}: a fresh ` +
-      `analysis would destroy it. Drop --no-idb-cache to reuse the cached database, pass --force to ` +
-      `re-analyze anyway, or 're cache clear ${basename(opts.binary)}' to discard it first.`);
+  if (backend === 'ida' && !useIdb && hasIdb(cacheDir, binHash, opts.module)) {
+    const existing = idbPath(cacheDir, binHash, opts.module);
+    if (!opts.force) {
+      return mkError(opts, binHash, backend, elapsed(start), 'AnalysisExists',
+        `Refusing to overwrite the existing analysis at ${existing}: a fresh analysis would destroy it. ` +
+        `Drop --no-idb-cache to reuse the cached database, 're cache clear ${basename(opts.binary)}' to discard ` +
+        `it, or pass --destructively-overwrite-existing to re-analyze (a database over 2 GB is backed up first).`);
+    }
+    // Forced overwrite: never TRULY destructive — preserve a large database before clobbering it.
+    try {
+      const backup = backupLargeIdb(existing);
+      if (backup) {
+        const gb = (statSync(backup).size / 1073741824).toFixed(1);
+        process.stderr.write(`[re] backed up existing ${gb} GB database to ${backup} before overwriting\n`);
+      }
+    } catch (e) {
+      return mkError(opts, binHash, backend, elapsed(start), 'BackupFailed',
+        `Could not back up the existing database at ${existing} before overwriting ` +
+        `(${e instanceof Error ? e.message : String(e)}); refusing to destroy it. Move or delete it manually, then retry.`);
+    }
   }
   const useHop = !opts.noIdbCache && backend === 'hopper' && hasHop(cacheDir, binHash, opts.module);
 

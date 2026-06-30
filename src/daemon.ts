@@ -21,7 +21,7 @@ import process from 'node:process';
 import type { BackendName } from './backends/types.ts';
 import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
-import { expandHome } from './util.ts';
+import { expandHome, backupLargeIdb } from './util.ts';
 import { startNarrator } from './progress.ts';
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
@@ -401,10 +401,22 @@ async function ensureReady(spec: DaemonRunSpec, key: string, socketPath: string,
       // Destructive-overwrite guard (defense in depth): a fresh daemon analysis writes a NEW
       // .i64 to outputIdbPath via `-c -o`, destroying any database already there. Refuse unless
       // forced. (Cold binaries have no .i64 here, so this only fires on the dangerous case.)
-      if (spec.outputIdbPath && !spec.force && existsSync(spec.outputIdbPath)) {
-        return { ok: false, error:
-          `refusing to overwrite the existing analysis at ${spec.outputIdbPath}: a fresh analysis ` +
-          `would destroy it. Pass --force to re-analyze, or 're cache clear' to discard it first.` };
+      if (spec.outputIdbPath && existsSync(spec.outputIdbPath)) {
+        if (!spec.force) {
+          return { ok: false, error:
+            `refusing to overwrite the existing analysis at ${spec.outputIdbPath}: a fresh analysis would ` +
+            `destroy it. Pass --destructively-overwrite-existing to re-analyze (a database over 2 GB is backed ` +
+            `up first), or 're cache clear' to discard it.` };
+        }
+        // Forced: back up a large database before clobbering — never truly destructive.
+        try {
+          const backup = backupLargeIdb(spec.outputIdbPath);
+          if (backup) process.stderr.write(`[re] backed up existing database to ${backup} before overwriting\n`);
+        } catch (e) {
+          return { ok: false, error:
+            `could not back up the existing database at ${spec.outputIdbPath} before overwriting ` +
+            `(${e instanceof Error ? e.message : String(e)}); refusing to destroy it.` };
+        }
       }
       try { writeFileSync(join(lockDir, 'pid'), String(process.pid)); } catch {}
       const pid = spawnDaemon(spec, key, socketPath, logPath);
