@@ -96,7 +96,7 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
 
   // ── Resolve binary + hash (mirrors runner.run's prologue) ──
   if (!existsSync(opts.binary)) {
-    return emitTerminalError(sink, queryId, start, 'file_not_found',
+    return emitTerminalError(sink, queryId,'file_not_found',
       `Binary not found: ${opts.binary}`, 0, null);
   }
 
@@ -111,13 +111,13 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
 
   // Streaming requires the IDA backend (Hopper has no auto_queue / incremental model yet).
   if (backend !== 'ida') {
-    return emitTerminalError(sink, queryId, start, 'validate_error',
+    return emitTerminalError(sink, queryId,'validate_error',
       `streaming requires the IDA backend (got: ${backend})`, 0, null);
   }
 
   const toolPath = opts.config.tools.idat64;
   if (!toolPath || !existsSync(toolPath)) {
-    return emitTerminalError(sink, queryId, start, 'ida_crashed',
+    return emitTerminalError(sink, queryId,'ida_crashed',
       'idat64 not found. Set RE_IDAT64 or add to ~/.config/re-cli/config.json', 0, null);
   }
 
@@ -132,7 +132,7 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
   let script: string;
   try { script = composeStreamScript(op, opts.params); }
   catch (e) {
-    return emitTerminalError(sink, queryId, start, 'script_crashed',
+    return emitTerminalError(sink, queryId,'script_crashed',
       `failed to compose streaming script: ${e instanceof Error ? e.message : String(e)}`, 0, null);
   }
 
@@ -279,9 +279,8 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     if (started.status === 'unavailable') {
       // We could not reach/spawn a daemon. The streaming protocol REQUIRES a live IDA, and
       // §11.1 disallows the old one-shot path here. Surface a terminal error (never NoOutput).
-      return emitTerminalError(sink, queryId, start, 'ida_crashed',
-        `could not start a streaming IDA session: ${started.error}`, runningCount, null,
-        cacheState);
+      return emitTerminalError(sink, queryId,'ida_crashed',
+        `could not start a streaming IDA session: ${started.error}`, runningCount, null);
     }
     emitMeta(started.pid);
     handle = started.handle;
@@ -312,14 +311,14 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
 
     // Terminal frame missing (daemon died mid-stream) AND no items → script_crashed (§6/§11.2.4).
     if (!terminal && closedEarly) {
-      return emitTerminalError(sink, queryId, start, 'script_crashed',
+      return emitTerminalError(sink, queryId,'script_crashed',
         'streaming IDA session ended without a terminal frame (daemon crashed?)',
-        runningCount, null, cacheState);
+        runningCount, null);
     }
 
     if (terminal && terminal.ok === false) {
-      return emitTerminalError(sink, queryId, start, 'script_crashed',
-        terminal.error ?? 'streaming script failed', runningCount, null, cacheState);
+      return emitTerminalError(sink, queryId,'script_crashed',
+        terminal.error ?? 'streaming script failed', runningCount, null);
     }
 
     // Snapshot mode: emit the single snapshot now (§5.5), right before complete.
@@ -342,8 +341,8 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     return exitCodeFor('complete');
   } catch (e) {
     flushPending(true);
-    return emitTerminalError(sink, queryId, start, 'ida_crashed',
-      `streaming failed: ${e instanceof Error ? e.message : String(e)}`, runningCount, null, cacheState);
+    return emitTerminalError(sink, queryId,'ida_crashed',
+      `streaming failed: ${e instanceof Error ? e.message : String(e)}`, runningCount, null);
   } finally {
     if (maxWaitTimer) clearTimeout(maxWaitTimer);
     process.removeListener('SIGINT', sigint);
@@ -353,15 +352,15 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────────
 
+// Emit a terminal `error` event (§5.8) and return its exit code. Error events carry no
+// cache_state and no durationSec per §5.8, so this needs neither a cache nor a start time.
 function emitTerminalError(
   sink: EventSink,
   queryId: string,
-  start: number,
   kind: ErrorKind,
   message: string,
   partialCount: number,
   logExcerpt: string | null,
-  _cacheState?: CacheState,
 ): number {
   const ev: ErrorEvent = {
     event: 'error', query_id: queryId, ts: now(),
