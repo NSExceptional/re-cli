@@ -211,6 +211,17 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     sink.push(ev);
   };
 
+  // Race-safe cooperative stop. A frame, the max-wait timer, or a signal can all ask to
+  // stop; the handle may not be assigned yet when the first request lands (it's set right
+  // after runStreamOnDaemon resolves, before any socket data is processed — but we guard
+  // regardless). If the handle isn't ready, we mark intent and apply it on assignment.
+  let stopRequested = false;
+  let handle: StreamExecHandle | undefined;
+  const requestStop = () => {
+    stopRequested = true;
+    handle?.stop();
+  };
+
   // Translate one daemon frame into buffered items / progress, applying dedup + max-matches.
   const onFrame = (f: StreamFrame): void => {
     if (f.kind === 'progress') {
@@ -237,22 +248,18 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
         }
       }
       flushPending(false);
-      if (stopReason === 'max_matches') {
-        // We have enough; stop the stream cooperatively.
-        handle?.stop();
-      }
+      if (stopReason === 'max_matches') requestStop();  // we have enough
     }
   };
 
   // ── Drive the daemon stream ──
-  let handle: StreamExecHandle | undefined;
 
   // max-wait wall-clock timer: fire a cooperative stop and record the reason.
   let maxWaitTimer: ReturnType<typeof setTimeout> | undefined;
   if (resolved.flags.maxWait !== undefined) {
     maxWaitTimer = setTimeout(() => {
       if (!stopReason) stopReason = 'max_wait';
-      handle?.stop();
+      requestStop();
     }, resolved.flags.maxWait * 1000);
   }
 
@@ -260,7 +267,7 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
   let interrupted: 'SIGINT' | 'SIGTERM' | null = null;
   const onSignal = (sig: 'SIGINT' | 'SIGTERM') => {
     interrupted = sig;
-    handle?.stop();
+    requestStop();
   };
   const sigint = () => onSignal('SIGINT');
   const sigterm = () => onSignal('SIGTERM');
@@ -278,6 +285,8 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     }
     emitMeta(started.pid);
     handle = started.handle;
+    // Apply any stop requested before the handle existed (max-wait/signal during startup).
+    if (stopRequested) handle.stop();
 
     const { terminal, closedEarly } = await handle.done;
 
