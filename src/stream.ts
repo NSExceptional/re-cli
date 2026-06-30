@@ -205,6 +205,8 @@ export interface StreamFlags {
   watch: boolean;
   resume?: string;
   noMeta: boolean;
+  // §5.2 cadence: seconds before a `status` event fires if no item yet (default 5).
+  statusThreshold: number;
 }
 
 // Resolved knobs the runner needs once validation passed.
@@ -300,6 +302,7 @@ export function parseStreamFlags(flags: Record<string, string | boolean>): Strea
     watch: flags['watch'] === true || flags['watch'] === 'true',
     resume: typeof flags['resume'] === 'string' ? flags['resume'] : undefined,
     noMeta: flags['meta'] === false || flags['no-meta'] === true,
+    statusThreshold: parsePositiveInt(flags['status-threshold'], '--status-threshold') ?? 5,
   };
 }
 
@@ -370,13 +373,18 @@ export function validateStream(op: string, flags: StreamFlags, isTTY: boolean): 
     }
   }
 
-  // §4.3 --resume / §5.6 --watch deferred — surface as validate errors so callers get a
-  // crisp message instead of silent no-ops. (See report: deferred features.)
-  if (flags.resume !== undefined) {
-    throw new ValidateError('--resume is not yet implemented (issue #13: deferred)');
+  // §5.6 --watch is only meaningful for streamable ops (non-streamable ops were already
+  // rejected above). It re-runs the query on mutation and never self-terminates without a
+  // stop condition, so it's incompatible with single-document json (already covered by the
+  // bounded check) and with --resume (resuming a still-open live query is meaningless).
+  if (flags.watch && flags.resume !== undefined) {
+    throw new ValidateError('--watch cannot be combined with --resume');
   }
-  if (flags.watch) {
-    throw new ValidateError('--watch is not yet implemented (issue #13: deferred)');
+  // The actual --resume cursor decode/validate happens in the runner, which knows the
+  // binary hash (the cursor is cache-aware, §9). Here we only sanity-check the envelope so
+  // an obviously-malformed token fails before connecting to IDA.
+  if (flags.resume !== undefined && !/^v\d+-.+$/.test(flags.resume)) {
+    throw new ValidateError(`--resume: malformed cursor (expected vN-…)`);
   }
 
   // Streaming "mode" is on whenever the op is streamable AND the caller asked for any
@@ -423,6 +431,170 @@ export function identityOf(op: string, item: Record<string, unknown>): string | 
   const internal = map[key] ?? key;
   const v = item[key] ?? item[internal];
   return v == null ? null : String(v);
+}
+
+// ─── Resume cursor + server-side dedup (§5.4, §5.7, §9; acceptance #4) ──────────────
+//
+// The cursor is the contract for `--resume`: it must let a follow-up call deliver ONLY
+// items the prior call did not. Because a cold huge-binary analysis discovers items in a
+// non-deterministic order (the Swift-metadata pass surfaces functions as it pleases), a
+// scalar high-water mark is insufficient — "the 200 I saw last time" is not a prefix of
+// "the 200 I'd see this time". The cursor therefore carries the *set of delivered
+// identities* (§5.4 identity field, op-specific) so dedup is order-independent and exact.
+//
+// Format: `v2-<base64url(JSON)>` where JSON = { v: 2, h: <binHash>, op: <op>, w: string[] }.
+//   - `v`  schema version (lets us evolve without silently mis-decoding old cursors).
+//   - `h`  binary hash at emission — a resume against a different binary is refused (§9:
+//          the cursor is cache-aware), so we never dedup across unrelated databases.
+//   - `op` the op, so a cursor from `re functions` can't be misapplied to `re strings`.
+//   - `w`  sorted array of delivered identity strings (the watermark). Sorted purely for
+//          a stable, diffable encoding; membership is what matters.
+//
+// Tradeoff (documented honestly): the cursor grows ~O(delivered identities). For the
+// existence-check / first-match / bounded-hunt workflows this spec targets, that set is
+// small. A purely positional cursor would be smaller but WRONG across reordered cold runs,
+// and silent re-delivery is worse than a long opaque token. v1 cursors (count-only, from
+// phase 1) are still decodable but carry no watermark, so a v1 resume dedups nothing —
+// surfaced as a validate error rather than a silent partial-resume.
+
+export const CURSOR_VERSION = 2;
+
+export interface CursorPayload {
+  v: number;
+  h: string;        // binary hash
+  op: string;
+  w: string[];      // delivered-identity watermark (sorted)
+}
+
+// base64url without padding — safe to pass as a bare CLI arg (no +, /, or = to quote).
+function b64urlEncode(s: string): string {
+  return Buffer.from(s, 'utf8').toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(s: string): string {
+  const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
+  return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64').toString('utf8');
+}
+
+// Encode a resume cursor from the set of identities delivered so far. Returns null when
+// nothing was delivered (the spec wants cursor=null in trivial/empty cases).
+export function encodeCursor(binHash: string, op: string, delivered: Iterable<string>): string | null {
+  const w = [...new Set(delivered)].sort();
+  if (w.length === 0) return null;
+  const payload: CursorPayload = { v: CURSOR_VERSION, h: binHash, op, w };
+  return `v${CURSOR_VERSION}-${b64urlEncode(JSON.stringify(payload))}`;
+}
+
+export class CursorError extends Error {
+  constructor(message: string) { super(message); this.name = 'CursorError'; }
+}
+
+// Decode + validate a `--resume` cursor for the current (binHash, op). Throws CursorError
+// (→ a terminal validate_error event, never a silent no-op) on any mismatch so a caller
+// can't accidentally resume against the wrong binary/op or a corrupt token.
+export function decodeCursor(raw: string, binHash: string, op: string): CursorPayload {
+  const m = /^v(\d+)-(.+)$/.exec(raw);
+  if (!m) throw new CursorError(`malformed --resume cursor (expected vN-…): ${raw.slice(0, 24)}…`);
+  const ver = Number(m[1]);
+  if (ver === 1) {
+    // Phase-1 placeholder cursor: {h,n}. It has no identity watermark, so honoring it
+    // would dedup nothing and silently re-deliver. Refuse loudly (acceptance #4 demands
+    // real dedup, not best-effort).
+    throw new CursorError(
+      '--resume given a v1 cursor (pre-dedup placeholder); re-run the query without --resume');
+  }
+  if (ver !== CURSOR_VERSION) {
+    throw new CursorError(`--resume cursor version ${ver} unsupported (this build emits v${CURSOR_VERSION})`);
+  }
+  let payload: CursorPayload;
+  try {
+    payload = JSON.parse(b64urlDecode(m[2])) as CursorPayload;
+  } catch {
+    throw new CursorError('--resume cursor is corrupt (could not decode payload)');
+  }
+  if (!payload || !Array.isArray(payload.w)) {
+    throw new CursorError('--resume cursor is corrupt (missing identity watermark)');
+  }
+  if (payload.h !== binHash) {
+    // §9: the cursor is cache-aware. A different binary hash means a different (or regrown)
+    // database — refuse rather than dedup against an unrelated identity set.
+    throw new CursorError(
+      `--resume cursor is for a different binary (cursor hash ${payload.h}, this binary ${binHash})`);
+  }
+  if (payload.op && payload.op !== op) {
+    throw new CursorError(`--resume cursor is for op '${payload.op}', not '${op}'`);
+  }
+  return payload;
+}
+
+// ─── Snapshot diffing for --watch deltas (§5.6) ────────────────────────────────────
+
+export interface SnapshotDiff {
+  added: Record<string, unknown>[];
+  removed: Record<string, unknown>[];
+}
+
+// Diff a fresh result set against the prior one by identity (§5.6): items whose identity
+// is new are `added`; identities that vanished are `removed`. Pure + deterministic so the
+// watch loop is unit-testable without a live IDA. `prior`/`next` are raw item dicts; we
+// key by identityOf so it works on internal-keyed items straight off the daemon.
+export function diffSnapshots(
+  op: string,
+  prior: Record<string, unknown>[],
+  next: Record<string, unknown>[],
+): SnapshotDiff {
+  const priorById = new Map<string, Record<string, unknown>>();
+  for (const it of prior) {
+    const id = identityOf(op, it);
+    if (id !== null) priorById.set(id, it);
+  }
+  const nextIds = new Set<string>();
+  const added: Record<string, unknown>[] = [];
+  for (const it of next) {
+    const id = identityOf(op, it);
+    if (id === null) continue;
+    nextIds.add(id);
+    if (!priorById.has(id)) added.push(it);
+  }
+  const removed: Record<string, unknown>[] = [];
+  for (const [id, it] of priorById) {
+    if (!nextIds.has(id)) removed.push(it);
+  }
+  return { added, removed };
+}
+
+// ─── Periodic status/progress cadence gating (§5.2, §5.3; ruling #4) ────────────────
+//
+// Pure decision logic for the timer-driven cadence, so the "emit status once iff the
+// first item is slower than the threshold; emit progress ~every interval while waiting;
+// suppress both once items flow" rules are testable without real wall-clock timers.
+
+export interface CadenceState {
+  firstItemSeen: boolean;   // has any item been delivered yet?
+  statusEmitted: boolean;   // has the one-shot `status` already fired?
+  lastProgressAt: number;   // ms timestamp of the last progress emission (0 = never)
+}
+
+export function newCadenceState(): CadenceState {
+  return { firstItemSeen: false, statusEmitted: false, lastProgressAt: 0 };
+}
+
+// Should a one-shot `status` fire now? Only before the first item, only once, and only
+// after the threshold has elapsed since query start (§5.2).
+export function shouldEmitStatus(
+  st: CadenceState, startMs: number, nowMs: number, thresholdMs: number,
+): boolean {
+  if (st.firstItemSeen || st.statusEmitted) return false;
+  return nowMs - startMs >= thresholdMs;
+}
+
+// Should a periodic `progress` fire now? Suppressed once items flow (§5.3), otherwise
+// every `intervalMs` of wall-clock while waiting.
+export function shouldEmitProgress(
+  st: CadenceState, nowMs: number, intervalMs: number,
+): boolean {
+  if (st.firstItemSeen) return false;
+  return nowMs - st.lastProgressAt >= intervalMs;
 }
 
 // ─── Event factory (§5) ──────────────────────────────────────────────────────────
