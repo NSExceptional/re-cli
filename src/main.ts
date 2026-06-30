@@ -7,7 +7,7 @@ import { join, basename } from 'node:path';
 import { loadConfig, CONFIG_FILE } from './config.ts';
 import { run } from './runner.ts';
 import type { DaemonMode } from './runner.ts';
-import { listDaemons, stopAllDaemons, stopDaemonsForBinary, daemonFor, daemonStreamStats, daemonKey } from './daemon.ts';
+import { listDaemons, stopAllDaemons, stopDaemonsForBinary, daemonFor, daemonStarting, daemonStreamStats, daemonKey } from './daemon.ts';
 import { analysisLockHolder } from './lock.ts';
 import { phaseFromLog } from './progress.ts';
 import { expandHome, binaryHash, elapsed } from './util.ts';
@@ -610,6 +610,9 @@ async function cmdStatus(
   const daemon = binHash ? await daemonFor(cacheDir, backend, binHash) : null;
   const holder = binHash ? analysisLockHolder(cacheDir, daemonKey(backend, binHash)) : null;
   const idbExists = binHash ? hasIdb(cacheDir, binHash) : false;
+  // A daemon mid-startup hasn't written meta.json yet (daemonFor returns null); detect it
+  // via the startup lock so a long first analysis reads as "warming", not "none".
+  const starting = (binHash && !daemon) ? daemonStarting(cacheDir, backend, binHash) : null;
 
   let database: Record<string, unknown> = { exists: false };
   if (idbExists) {
@@ -618,7 +621,7 @@ async function cmdStatus(
     database = { exists: true, path: p, sizeMb: +(s.size / 1048576).toFixed(1), mtime: new Date(s.mtimeMs).toISOString() };
   }
 
-  const warming = (daemon != null && !daemon.ready) || holder != null;
+  const warming = (daemon != null && !daemon.ready) || holder != null || starting != null;
   const ready = (daemon != null && daemon.ready) || idbExists;
   const state = ready ? 'ready' : warming ? 'warming' : 'none';
   const now = Date.now();
@@ -659,7 +662,9 @@ async function cmdStatus(
           // streaming query is in flight.
           itemsEmitted: streamItems, etaSec: streamEta, op: streamOp,
         }
-      : { inFlight: false, phase, itemsEmitted: streamItems, etaSec: streamEta, op: streamOp },
+      : starting != null
+        ? { inFlight: true, pid: starting, elapsedSec: null, phase, itemsEmitted: streamItems, etaSec: streamEta, op: streamOp }
+        : { inFlight: false, phase, itemsEmitted: streamItems, etaSec: streamEta, op: streamOp },
     database,
   };
 
@@ -667,6 +672,7 @@ async function cmdStatus(
     console.log(`${binary}${arch ? ` (${arch})` : ''} — ${state.toUpperCase()}`);
     if (data.daemon.running) console.log(`  daemon     pid ${daemon!.pid}, up ${data.daemon.uptimeSec}s${daemon!.ready ? '' : ' (warming)'}${phase ? ` · ${phase}` : ''}`);
     if (holder) console.log(`  analyzing  pid ${holder.pid || '?'}, ${data.analysis.elapsedSec ?? '?'}s elapsed${phase ? ` · ${phase}` : ''}`);
+    else if (starting != null) console.log(`  analyzing  pid ${starting} (daemon starting)${phase ? ` · ${phase}` : ''}`);
     if (streamItems !== null) {
       const eta = streamEta === null ? '?' : `${streamEta}s`;
       console.log(`  streaming  ${streamOp ?? 'query'} · ${streamItems} items emitted · ETA ${eta}`);

@@ -442,6 +442,19 @@ export async function daemonFor(
   return { pid: meta.pid, startedAt: meta.startedAt, ready: await canConnect(meta.socketPath) };
 }
 
+// Is a daemon currently STARTING for this binary — analyzing before its socket binds and
+// meta.json is written? Returns the starter pid, else null. Lets `re status` report
+// "warming" during the long first analysis instead of a misleading "none".
+export function daemonStarting(cacheDir: string, backend: BackendName, binHash: string, module?: string): number | null {
+  const pidFile = join(registryDir(cacheDir, daemonKey(backend, binHash, module)), 'lock', 'pid');
+  try {
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    return pid && pidAlive(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
 // Live streaming telemetry for `re status` (issue #13 criterion #2): items emitted so far,
 // phase, and a rough ETA for any in-flight streaming query, fetched via the daemon's `ping`
 // WITHOUT consuming the query. Returns null when no daemon is reachable or none is streaming.
