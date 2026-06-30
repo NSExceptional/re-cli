@@ -43,6 +43,15 @@ function phaseOf(lines: string[]): string | undefined {
   return undefined;
 }
 
+// Best-effort coarse phase from a backend log file's tail (for `re status`, issue #13
+// criterion #2). Returns undefined when the log is empty or no phase line is recognized.
+export function phaseFromLog(logPath: string): string | undefined {
+  const text = tailRead(logPath);
+  if (!text) return undefined;
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  return phaseOf(lines);
+}
+
 export interface HbState { lastLine?: string; phase?: string; }
 
 // Pure, unit-testable: build one heartbeat line from the current log tail. Threads
