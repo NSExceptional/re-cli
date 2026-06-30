@@ -18,6 +18,10 @@ import {
 } from './dsc.ts';
 import type { SimPlatform } from './dsc.ts';
 import type { REResult, BackendName } from './result.ts';
+import {
+  STREAM_VALUE_FLAGS, hasStreamingFlags, parseStreamFlags, validateStream, ValidateError,
+} from './stream.ts';
+import { runStream } from './stream_runner.ts';
 
 // ─── Arg parsing ────────────────────────────────────────────────────────────
 
@@ -26,6 +30,8 @@ const VALUE_FLAGS = new Set([
   'function', 'address', 'count', 'filter', 'type',
   'min-length', 'to', 'from', 'library', 'range',
   'older-than', 'max-size',
+  // Streaming API (issue #13) value-taking flags.
+  ...STREAM_VALUE_FLAGS,
 ]);
 
 interface ParsedArgs {
@@ -792,6 +798,18 @@ Global flags:
                                      off (or --no-daemon) always runs one-shot
   --format     json | pretty         (default: json)
 
+Streaming (issue #13 — functions/symbols/strings/xrefs only):
+  --first-match                      Stop after the first match (alias for --max-matches 1)
+  --max-matches N                    Stop and emit 'complete' after N items
+  --max-wait S                       Stop after S wall-clock seconds (honors partial analysis)
+  --min-batch-size N                 Buffer until N items before emitting a 'partial'
+  --stream                           Force NDJSON event output even on a warm cache
+  --emit       <events>              Whitelist events (aliases: items, progress, status)
+  --fields     <fields>              Project items to these fields (op-specific)
+  --format     json | jsonl | tsv | pretty   (json requires a bounded query)
+  --no-meta                          Suppress the opening 'meta' event
+  (--watch and --resume are specified but not yet implemented — they error in validate)
+
 Config: ${CONFIG_FILE}
 `;
 
@@ -877,6 +895,38 @@ async function main(): Promise<void> {
   if (!binary) {
     process.stderr.write(`Usage: re ${command} <binary> [flags]\n`);
     process.exit(1);
+  }
+
+  // ── Streaming API (issue #13) ──
+  // When any streaming flag is present, take the NDJSON event path. Validation runs BEFORE
+  // touching IDA so bad flag combos exit 1 with a crisp message (§4, §8).
+  if (hasStreamingFlags(flags)) {
+    let resolved;
+    try {
+      const sflags = parseStreamFlags(flags);
+      resolved = validateStream(command, sflags, Boolean(process.stdout.isTTY));
+    } catch (e) {
+      if (e instanceof ValidateError) {
+        process.stderr.write(`validate error: ${e.message}\n`);
+        process.exit(1);  // §8 exit 1: validate failed before connecting to IDA
+      }
+      throw e;
+    }
+    // A streamable op with event output goes through the orchestrator; a non-streamable op
+    // (info/imports/segments/decompile/disasm) that merely set --format jsonl/--no-meta etc.
+    // still has no streaming body — fall through to the legacy run() below for those.
+    if (resolved.enabled) {
+      const code = await runStream({
+        resolved,
+        binary,
+        arch: flags['arch'] as string | undefined,
+        params: paramsFor(flags),
+        config,
+        backend: backend as 'auto' | BackendName,
+        timeout,
+      });
+      process.exit(code);
+    }
   }
 
   const result = await run({

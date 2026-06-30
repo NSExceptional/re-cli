@@ -18,6 +18,7 @@ import sys
 import json
 import struct
 import socket
+import time
 
 import idc
 import idaapi
@@ -79,8 +80,97 @@ def _send_frame(conn, obj):
     conn.sendall(struct.pack('>I', len(data)) + data)
 
 
+def _deadline_wait(deadline_sec):
+    """Deadline-bounded replacement for raw auto_wait() (spec §11.3). Never blocks
+    forever on a Swift-metadata queue that won't drain; streaming works against partial
+    state. Returns True if analysis fully settled, False if we proceeded on the deadline."""
+    deadline = time.time() + max(0.0, float(deadline_sec))
+    while time.time() < deadline:
+        try:
+            busy = idaapi.is_auto_enabled() and not ida_auto.auto_is_ok()
+        except Exception:
+            # Older/newer IDA API drift — fall back to auto_is_ok alone.
+            try:
+                busy = not ida_auto.auto_is_ok()
+            except Exception:
+                busy = False
+        if not busy:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _stream_exec(conn, req):
+    """Handle a streaming exec (issue #13). The composed script is given three helpers in
+    its namespace — emit(items), should_stop(), progress(phase, percent) — and is expected
+    to drive them, then the script ends. We always send a terminal `final` frame so the
+    client never sees NoOutput. Frames are written directly to `conn`."""
+    rid = req.get('id')
+    script = req.get('script', '')
+    deadline_sec = float(req.get('deadline', 600) or 600)
+
+    state = {'count': 0, 'stopped': False, 'reason': 'natural', 'settled': False}
+
+    def _emit(items):
+        if not items:
+            return
+        state['count'] += len(items)
+        _send_frame(conn, {'id': rid, 'kind': 'partial', 'items': items,
+                           'count': state['count']})
+
+    def _progress(phase=None, percent=None):
+        _send_frame(conn, {'id': rid, 'kind': 'progress',
+                           'phase': phase, 'percent': percent})
+
+    def _should_stop():
+        # The client closes the connection to request a cooperative early stop; detect a
+        # peer-closed socket without blocking. (Non-blocking peek.)
+        if state['stopped']:
+            return True
+        try:
+            conn.setblocking(False)
+            try:
+                peek = conn.recv(1, socket.MSG_PEEK)
+                if peek == b'':
+                    state['stopped'] = True
+                    state['reason'] = 'client_closed'
+            except (BlockingIOError, socket.error):
+                pass
+            finally:
+                conn.setblocking(True)
+        except Exception:
+            pass
+        return state['stopped']
+
+    def _deadline(secs=None):
+        return _deadline_wait(deadline_sec if secs is None else secs)
+
+    ns = {
+        '__name__': '__re_stream__',
+        '__builtins__': __builtins__,
+        '_re_emit': _emit,
+        '_re_progress': _progress,
+        '_re_should_stop': _should_stop,
+        '_re_deadline_wait': _deadline,
+        '_RE_STREAM_DEADLINE': deadline_sec,
+        '_re_stream_state': state,
+    }
+    try:
+        exec(compile(script, '<re-stream>', 'exec'), ns)
+        # The script may set its own terminal reason in _re_stream_state; default natural.
+        final = {'id': rid, 'kind': 'final', 'final': True, 'ok': True,
+                 'count': state['count'], 'reason': state.get('reason', 'natural')}
+        _send_frame(conn, final)
+    except BaseException as e:
+        # Spec §5.8 / §11.2.4: a crashed streaming script must still yield a terminal frame.
+        _send_frame(conn, {'id': rid, 'kind': 'final', 'final': True, 'ok': False,
+                           'count': state['count'],
+                           'error': '%s: %s' % (type(e).__name__, e)})
+
+
 def _handle(req):
-    """Return (response_dict, should_quit)."""
+    """Return (response_dict, should_quit). Only for single-response request types;
+    `stream_exec` is handled inline in the serve loop because it writes many frames."""
     rid = req.get('id')
     kind = req.get('type')
 
@@ -156,6 +246,10 @@ def _serve():
                 req = _recv_frame(conn)
                 if req is None:
                     break  # client closed the connection
+                if req.get('type') == 'stream_exec':
+                    # Streaming requests write their own frames (many) then a terminal one.
+                    _stream_exec(conn, req)
+                    continue
                 resp, should_quit = _handle(req)
                 _send_frame(conn, resp)
                 if should_quit:

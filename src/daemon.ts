@@ -169,6 +169,122 @@ function sendRequest(socketPath: string, req: object, timeoutMs: number): Promis
   });
 }
 
+// ─── Streaming request (issue #13) ──────────────────────────────────────────────
+//
+// A streaming exec differs from `sendRequest` in that the daemon emits MANY framed
+// messages for one request: zero-or-more non-terminal frames (carrying `partial`/
+// `progress` payloads) followed by exactly one terminal frame. Each frame is the same
+// length-prefixed (4-byte big-endian) JSON envelope used elsewhere; we just keep reading
+// frames off the same connection until we see one tagged `final: true`.
+//
+// This is how we satisfy spec §11.1's GOAL ("a live IDA that streams") without building a
+// separate `idat64 --listen` — the existing warm daemon already IS a persistent IDA, so
+// we extend its socket protocol to multiplex frames instead of returning a single {ok}.
+
+export interface StreamFrame {
+  // What kind of payload this frame carries. The daemon-side streaming script tags each
+  // emitted frame; the runner translates these into spec events.
+  kind: 'partial' | 'progress' | 'final' | 'log';
+  final?: boolean;
+  // partial: an array of raw item dicts (op-internal key names).
+  items?: Record<string, unknown>[];
+  // progress: phase/percent hints.
+  phase?: string;
+  percent?: number | null;
+  // final: terminal status from the script's perspective.
+  ok?: boolean;
+  reason?: string;       // 'natural' | 'db_settled' | 'max_matches' | 'max_wait' (script view)
+  error?: string;        // populated when ok === false
+  count?: number;        // total items the script delivered
+}
+
+export interface StreamExecHandle {
+  // Resolves when the terminal frame arrives or the connection ends.
+  done: Promise<{ terminal: StreamFrame | null; closedEarly: boolean }>;
+  // Ask the daemon to stop the in-flight stream early (best-effort: closes the
+  // connection, which the daemon-side loop treats as a cooperative stop signal).
+  stop(): void;
+}
+
+// Open a streaming exec on the daemon. `onFrame` is invoked for every non-terminal frame
+// as it arrives. The returned handle's `done` settles on the terminal frame.
+export function streamExecOnDaemon(
+  socketPath: string,
+  scriptText: string,
+  deadlineSec: number,
+  onFrame: (f: StreamFrame) => void,
+  timeoutMs: number,
+): StreamExecHandle {
+  let resolveDone!: (v: { terminal: StreamFrame | null; closedEarly: boolean }) => void;
+  let rejectDone!: (e: unknown) => void;
+  const done = new Promise<{ terminal: StreamFrame | null; closedEarly: boolean }>((res, rej) => {
+    resolveDone = res; rejectDone = rej;
+  });
+
+  const sock = net.createConnection(socketPath);
+  let buf = Buffer.alloc(0);
+  let expected = -1;
+  let settled = false;
+  let terminal: StreamFrame | null = null;
+
+  const finish = (closedEarly: boolean) => {
+    if (settled) return;
+    settled = true;
+    try { sock.end(); } catch {}
+    resolveDone({ terminal, closedEarly });
+  };
+  const fail = (e: unknown) => {
+    if (settled) return;
+    settled = true;
+    try { sock.destroy(); } catch {}
+    rejectDone(e);
+  };
+
+  sock.once('connect', () => {
+    const req = { id: 1, type: 'stream_exec', script: scriptText, deadline: deadlineSec };
+    const body = Buffer.from(JSON.stringify(req), 'utf8');
+    const hdr = Buffer.alloc(4);
+    hdr.writeUInt32BE(body.length, 0);
+    sock.write(hdr);
+    sock.write(body);
+  });
+
+  sock.on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    // Drain as many complete frames as are buffered.
+    for (;;) {
+      if (expected < 0) {
+        if (buf.length < 4) break;
+        expected = buf.readUInt32BE(0);
+      }
+      if (buf.length < 4 + expected) break;
+      const frameBuf = buf.subarray(4, 4 + expected);
+      buf = buf.subarray(4 + expected);
+      expected = -1;
+      let frame: StreamFrame;
+      try { frame = JSON.parse(frameBuf.toString('utf8')) as StreamFrame; }
+      catch (e) { fail(e); return; }
+      if (frame.kind === 'final' || frame.final) {
+        terminal = frame;
+        finish(false);
+        return;
+      }
+      try { onFrame(frame); } catch {}
+    }
+  });
+
+  sock.once('error', fail);
+  // The connection ending without a terminal frame is "closed early" (e.g. daemon died
+  // mid-stream); the runner synthesizes a terminal event so the caller never gets NoOutput.
+  sock.once('close', () => finish(true));
+  if (timeoutMs > 0) sock.setTimeout(timeoutMs, () => fail(new Error('daemon stream timed out')));
+
+  return {
+    done,
+    stop() { try { sock.end(); } catch {} },
+  };
+}
+
 // Poll until the daemon's socket is connectable (== ready, since it binds only after
 // analysis). Narrates progress; bails if the process backing the daemon dies first.
 async function waitReady(
@@ -344,6 +460,32 @@ export async function runOnDaemon(spec: DaemonRunSpec, scriptText: string): Prom
     // Connection dropped mid-flight (e.g. daemon crashed): let the caller fall back.
     return { status: 'unavailable', error: `daemon request failed: ${e instanceof Error ? e.message : String(e)}` };
   }
+}
+
+// Streaming variant of runOnDaemon (issue #13): ensures a daemon is up, then opens a
+// streaming exec. Returns the daemon's pid (for the `meta.ida_pid` field), a handle to
+// the stream, and whether a daemon was reachable at all (so the runner can fall back).
+export async function runStreamOnDaemon(
+  spec: DaemonRunSpec,
+  scriptText: string,
+  deadlineSec: number,
+  onFrame: (f: StreamFrame) => void,
+): Promise<
+  | { status: 'streaming'; pid: number; handle: StreamExecHandle }
+  | { status: 'unavailable'; error: string }
+> {
+  const key = daemonKey(spec.backend, spec.binHash, spec.module);
+  const socketPath = socketPathFor(key);
+  const dir = registryDir(spec.cacheDir, key);
+  const logPath = join(dir, 'daemon.log');
+
+  const ready = await ensureReady(spec, key, socketPath, dir, logPath);
+  if (!ready.ok) return { status: 'unavailable', error: ready.error };
+
+  const meta = readMeta(dir);
+  const pid = meta?.pid ?? -1;
+  const handle = streamExecOnDaemon(socketPath, scriptText, deadlineSec, onFrame, spec.timeoutMs);
+  return { status: 'streaming', pid, handle };
 }
 
 // ─── Management (re daemon list/stop) ────────────────────────────────────────────
