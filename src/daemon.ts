@@ -112,7 +112,11 @@ function writeMeta(dir: string, meta: DaemonMeta): void {
 }
 
 function cleanup(dir: string, socketPath: string): void {
-  try { rmSync(metaPath(dir), { force: true }); } catch {}
+  // Remove the WHOLE registry dir, not just meta.json. It's runtime state for one live daemon
+  // (meta.json liveness record + daemon.log + lock/), so once that process is gone it's pure
+  // clutter — a heavily-analyzed binary leaves a multi-hundred-MB daemon.log behind. A later
+  // start recreates the dir. The socket lives under /tmp (not in dir), so unlink it separately.
+  try { rmSync(dir, { recursive: true, force: true }); } catch {}
   try { rmSync(socketPath, { force: true }); } catch {}
 }
 
@@ -624,7 +628,15 @@ export async function listDaemons(cacheDir: string): Promise<DaemonStatus[]> {
   for (const key of readdirSync(base)) {
     const dir = join(base, key);
     const meta = readMeta(dir);
-    if (!meta) continue;
+    if (!meta) {
+      // No liveness record: either a daemon is mid-startup (about to write meta) or this is an
+      // orphaned leftover (a stopped daemon's daemon.log/lock — pre-fix, cleanup only stripped
+      // meta.json). Keep it only while a starter pid is still live; otherwise prune the dir.
+      let starterAlive = false;
+      try { starterAlive = pidAlive(Number(readFileSync(join(dir, 'lock', 'pid'), 'utf8').trim())); } catch {}
+      if (!starterAlive) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
+      continue;
+    }
     // Phase 3: prune ONLY when the process is dead. A daemon that's alive but not yet
     // connectable is WARMING (binds its socket mid-analysis) — pruning it here would orphan
     // a live IDA (undiscoverable, and the next query would spawn a duplicate). `alive` in the
