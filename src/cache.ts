@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { expandHome } from './util.ts';
 import type { REResult } from './result.ts';
@@ -99,4 +99,20 @@ export function readIdbMeta(cacheDir: string, hash: string, module?: string): Pa
   } catch {
     return null;
   }
+}
+
+// IDA's unpacked working files, which coexist with the packed binary.i64 only while a database
+// is open. The daemon deletes them on a graceful exit; this is the backstop for a hard kill.
+const IDB_UNPACKED_EXTS = ['id0', 'id1', 'id2', 'nam', 'til'];
+
+// Remove unpacked working files a hard-killed (SIGKILL / power loss) daemon left behind, so IDA
+// re-opens the packed binary.i64 cleanly and the ~GB of scratch doesn't linger. Keeps the .i64.
+// Returns bytes reclaimed. Caller must ensure no live process still holds this database open.
+export function purgeUnpackedIdb(idbDir: string): number {
+  let freed = 0;
+  for (const ext of IDB_UNPACKED_EXTS) {
+    const f = join(idbDir, `binary.${ext}`);
+    try { freed += statSync(f).size; unlinkSync(f); } catch { /* absent — fine */ }
+  }
+  return freed;
 }

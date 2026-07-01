@@ -22,6 +22,7 @@ import type { BackendName } from './backends/types.ts';
 import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
 import { expandHome, backupLargeIdb } from './util.ts';
+import { purgeUnpackedIdb } from './cache.ts';
 import { startNarrator } from './progress.ts';
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
@@ -323,6 +324,15 @@ async function waitReady(
 function spawnDaemon(spec: DaemonRunSpec, key: string, socketPath: string, logPath: string): number {
   mkdirSync(SOCK_DIR, { recursive: true, mode: 0o700 });
   const daemonScript = join(SCRIPTS_DIR, spec.backend, '_daemon.py');
+
+  // Backstop for a hard-killed prior session (SIGKILL / power loss skips the daemon's graceful
+  // handler): clear stale unpacked working files before opening a warm .i64, so IDA re-unpacks
+  // it cleanly (no stale-lock recovery prompt, no leftover ~GB scratch). Only for a warm reload
+  // — a fresh analysis has no .i64, and any components present are its own in-flight work.
+  if (spec.backend === 'ida' && spec.idbPath) {
+    const freed = purgeUnpackedIdb(dirname(spec.idbPath));
+    if (freed > 0) process.stderr.write(`[re] cleared ${(freed / 1073741824).toFixed(1)} GB of stale unpacked database scratch\n`);
+  }
 
   const invoke = {
     binaryPath: spec.effectiveBinary,

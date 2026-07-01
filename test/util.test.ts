@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { backupLargeIdb, IDB_BACKUP_THRESHOLD_BYTES } from '../src/util.ts';
-import { writeIdbMeta, readIdbMeta, type IdbMeta } from '../src/cache.ts';
+import { writeIdbMeta, readIdbMeta, purgeUnpackedIdb, type IdbMeta } from '../src/cache.ts';
 
 test('backupLargeIdb: a sub-threshold file is left in place (overwrite is cheap)', () => {
   const dir = mkdtempSync(join(tmpdir(), 're-bak-'));
@@ -62,4 +62,19 @@ test('writeIdbMeta/readIdbMeta: round-trips identifying metadata to idb/<hash>/m
     assert.equal(r?.path, '/x/MusicallyCore');
     assert.equal(readIdbMeta(cacheDir, 'missing'), null);
   } finally { rmSync(cacheDir, { recursive: true, force: true }); }
+});
+
+test('purgeUnpackedIdb: deletes the .id*/.nam/.til scratch, keeps binary.i64 and unrelated files', () => {
+  const dir = mkdtempSync(join(tmpdir(), 're-purge-'));
+  try {
+    for (const f of ['binary.i64', 'binary.id0', 'binary.id1', 'binary.id2', 'binary.nam', 'binary.til', 'meta.json'])
+      writeFileSync(join(dir, f), 'x'.repeat(10));
+    const freed = purgeUnpackedIdb(dir);
+    assert.equal(freed, 50, '5 components × 10 bytes reclaimed');
+    assert.ok(existsSync(join(dir, 'binary.i64')), 'packed .i64 kept');
+    assert.ok(existsSync(join(dir, 'meta.json')), 'unrelated files kept');
+    for (const c of ['id0', 'id1', 'id2', 'nam', 'til'])
+      assert.ok(!existsSync(join(dir, `binary.${c}`)), `binary.${c} removed`);
+    assert.equal(purgeUnpackedIdb(dir), 0, 'idempotent — nothing left to purge');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

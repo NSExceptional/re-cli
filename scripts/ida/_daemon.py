@@ -19,6 +19,7 @@ import json
 import struct
 import socket
 import time
+import signal
 
 import idc
 import idaapi
@@ -64,6 +65,44 @@ def _save_database(path):
     except Exception as e:
         _log('save_database failed (serving from memory): %s' % e)
         return False
+
+
+def _purge_unpacked():
+    """Delete IDA's unpacked working files (.id0/.id1/.id2/.nam/.til) so the idb folder is left
+    tidy — just the packed binary.i64 — when the daemon exits. Only when the .i64 already exists
+    (a warm/settled database holds the whole analysis); if there's no .i64 yet (a fresh analysis
+    still in flight) the components are the ONLY copy, so we keep them. Unlinking files IDA still
+    has open is safe on Unix — its file descriptors keep working and the disk space is reclaimed
+    when the process exits — so this needs no re-pack (a 12 GB re-pack couldn't finish inside the
+    OS shutdown grace window and would risk a half-written, corrupt .i64)."""
+    try:
+        idb = idc.get_idb_path()
+        if not idb or not os.path.exists(idb):
+            return
+        base = idb[:-4] if idb.lower().endswith('.i64') else idb
+        for ext in ('.id0', '.id1', '.id2', '.nam', '.til'):
+            try:
+                os.unlink(base + ext)
+            except OSError:
+                pass
+    except Exception as e:
+        _log('purge_unpacked failed: %s' % e)
+
+
+def _graceful_exit(code=0):
+    """Tidy shutdown: drop the unpacked scratch, remove the socket, then exit. Used by the
+    signal handlers (OS/computer shutdown, `re daemon stop`) and the idle-timeout path."""
+    _purge_unpacked()
+    try:
+        os.unlink(SOCK_PATH)
+    except OSError:
+        pass
+    idc.qexit(code)
+
+
+def _on_signal(signum, _frame):
+    _log('received signal %d; shutting down gracefully' % signum)
+    _graceful_exit(0)
 
 
 # ─── Incremental analysis driver (issue #13 Phase 3) ────────────────────────────────
@@ -387,6 +426,16 @@ def _serve():
         idc.qexit(2)
         return
 
+    # Shut down gracefully on SIGTERM (computer shutdown, `re daemon stop`) / SIGINT: drop the
+    # unpacked scratch files and release the socket instead of being hard-killed mid-session and
+    # leaving ~GB of orphaned .id0/.id1 clutter behind. The handler interrupts the accept() wait,
+    # so it responds promptly even while idling.
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+    except Exception as e:
+        _log('could not install signal handlers: %s' % e)
+
     # Bind BEFORE analysis finishes (Phase 3): the daemon must be reachable WHILE a huge
     # binary is still analyzing, so a streaming query can attach and drive/observe partial
     # results instead of the client blocking ~80 min waiting for the socket to appear. The
@@ -459,11 +508,10 @@ def _serve():
 
     try:
         srv.close()
-        os.unlink(SOCK_PATH)
     except OSError:
         pass
     _log('exiting')
-    idc.qexit(0)
+    _graceful_exit(0)  # idle-timeout / quit path: also tidy the unpacked scratch
 
 
 _serve()
