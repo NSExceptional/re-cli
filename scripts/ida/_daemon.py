@@ -433,6 +433,13 @@ def _serve():
     try:
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGINT, _on_signal)
+        # Ignore SIGPIPE. A client that connects then disconnects mid-write — a canConnect probe,
+        # an aborted/timed-out query, or a second `re` racing to start a daemon for the same
+        # binary — must NOT kill the daemon. IDA's default SIGPIPE handling terminates the process
+        # ("Received a SIGPIPE signal"); with SIG_IGN the socket write instead raises
+        # BrokenPipeError, which the serve loop already catches, drops the connection, and keeps
+        # serving. This is what makes concurrent queries during warm-up safe.
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     except Exception as e:
         _log('could not install signal handlers: %s' % e)
 
