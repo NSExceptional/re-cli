@@ -12,7 +12,7 @@ import { binaryHash, resultKey, randomId, elapsed, expandHome, machoArchs, backu
 import {
   hasIdb, idbPath, idbCacheDir, ensureIdbDir,
   hasHop, hopPath,
-  getCachedResult, saveResult,
+  getCachedResult, saveResult, writeIdbMeta, readIdbMeta,
 } from './cache.ts';
 import { buildIdaCommand } from './backends/ida.ts';
 import { buildHopperCommand } from './backends/hopper.ts';
@@ -265,17 +265,26 @@ function finalizeCaching(
   if (!opts.noCache && result.status === 'ok') {
     saveResult(cacheDir, resultKey(binHash, opts.command, cacheKeyParams), result);
   }
-  if (!useIdb && backend === 'ida') {
-    const idbDir = idbCacheDir(cacheDir, binHash, opts.module);
-    const idbFile = join(idbDir, 'binary.i64');
-    if (existsSync(idbFile)) {
+  if (backend === 'ida') {
+    const idbFile = idbPath(cacheDir, binHash, opts.module);
+    // Write self-describing metadata for a fresh analysis; on reload, backfill/upgrade when the
+    // file is missing or is the old minimal format (no binHash field). Preserve the original
+    // build time (the .i64 mtime) when upgrading so analyzedAt stays meaningful.
+    const existing = readIdbMeta(cacheDir, binHash, opts.module);
+    if (existsSync(idbFile) && (!useIdb || !existing || !existing.binHash)) {
       const s = statSync(effectiveBinary);
-      writeFileSync(join(idbDir, 'meta.json'), JSON.stringify({
+      writeIdbMeta(cacheDir, binHash, opts.module, {
+        name: basename(opts.binary),
         path: opts.binary,
+        ...(opts.arch ? { arch: opts.arch } : {}),
+        ...(opts.module ? { module: opts.module } : {}),
+        backend,
+        backendVersion: result.backendVersion,
+        binHash,
+        analyzedAt: useIdb ? new Date(statSync(idbFile).mtimeMs).toISOString() : new Date().toISOString(),
         mtimeMs: s.mtimeMs,
         size: s.size,
-        ...(opts.module ? { module: opts.module } : {}),
-      }));
+      });
     }
   }
 }

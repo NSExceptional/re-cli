@@ -67,3 +67,36 @@ export function ensureIdbDir(cacheDir: string, hash: string, module?: string): s
   mkdirSync(dir, { recursive: true });
   return dir;
 }
+
+// Self-describing metadata written next to each cached database (idb/<hash>/meta.json), so a
+// bare hash folder is identifiable — which binary it is, where it came from, how it was built.
+export interface IdbMeta {
+  name: string;                    // basename of the original binary
+  path: string;                    // absolute path the binary was analyzed from
+  arch?: string;                   // --arch slice, if any
+  module?: string;                 // DSC module, if the source is a dyld shared cache
+  backend: string;                 // 'ida' | 'hopper'
+  backendVersion?: string | null;  // e.g. IDA kernel version
+  binHash: string;                 // this folder's hash (self-reference)
+  analyzedAt: string;              // ISO 8601 — when the database was built
+  mtimeMs: number;                 // stat of the analyzed binary/slice (the hash inputs)
+  size: number;                    // byte size of the analyzed binary/slice
+}
+
+export function writeIdbMeta(cacheDir: string, hash: string, module: string | undefined, meta: IdbMeta): void {
+  try {
+    const dir = idbCacheDir(cacheDir, hash, module);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n');
+  } catch {
+    // Metadata is best-effort — never fail a query because we couldn't write it.
+  }
+}
+
+export function readIdbMeta(cacheDir: string, hash: string, module?: string): Partial<IdbMeta> | null {
+  try {
+    return JSON.parse(readFileSync(join(idbCacheDir(cacheDir, hash, module), 'meta.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}

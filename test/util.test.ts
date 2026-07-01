@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { backupLargeIdb, IDB_BACKUP_THRESHOLD_BYTES } from '../src/util.ts';
+import { writeIdbMeta, readIdbMeta, type IdbMeta } from '../src/cache.ts';
 
 test('backupLargeIdb: a sub-threshold file is left in place (overwrite is cheap)', () => {
   const dir = mkdtempSync(join(tmpdir(), 're-bak-'));
@@ -42,4 +43,23 @@ test('backupLargeIdb: missing file → null (nothing to back up)', () => {
 
 test('IDB_BACKUP_THRESHOLD_BYTES is 2 GB', () => {
   assert.equal(IDB_BACKUP_THRESHOLD_BYTES, 2 * 1024 ** 3);
+});
+
+test('writeIdbMeta/readIdbMeta: round-trips identifying metadata to idb/<hash>/meta.json', () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 're-meta-'));
+  try {
+    const meta: IdbMeta = {
+      name: 'MusicallyCore', path: '/x/MusicallyCore', arch: 'arm64', backend: 'ida',
+      backendVersion: '8.3', binHash: 'abc123', analyzedAt: '2026-07-01T00:00:00.000Z',
+      mtimeMs: 123, size: 456,
+    };
+    writeIdbMeta(cacheDir, 'abc123', undefined, meta);
+    assert.ok(existsSync(join(cacheDir, 'idb', 'abc123', 'meta.json')), 'written under idb/<hash>/');
+    const r = readIdbMeta(cacheDir, 'abc123');
+    assert.equal(r?.name, 'MusicallyCore');
+    assert.equal(r?.arch, 'arm64');
+    assert.equal(r?.binHash, 'abc123');
+    assert.equal(r?.path, '/x/MusicallyCore');
+    assert.equal(readIdbMeta(cacheDir, 'missing'), null);
+  } finally { rmSync(cacheDir, { recursive: true, force: true }); }
 });

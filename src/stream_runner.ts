@@ -16,7 +16,7 @@ import process from 'node:process';
 import type { Config } from './config.ts';
 import type { BackendName } from './result.ts';
 import { binaryHash, expandHome, elapsed, machoArchs } from './util.ts';
-import { hasIdb, idbPath, ensureIdbDir } from './cache.ts';
+import { hasIdb, idbPath, idbCacheDir, ensureIdbDir, writeIdbMeta } from './cache.ts';
 import {
   runStreamOnDaemon, type DaemonRunSpec, type StreamFrame, type StreamExecHandle,
 } from './daemon.ts';
@@ -211,7 +211,29 @@ export async function runStream(opts: StreamRunOptions): Promise<number> {
     cacheState,
   };
 
-  return resolved.flags.watch ? runWatch(ctx) : runStreamOnce(ctx);
+  const code = await (resolved.flags.watch ? runWatch(ctx) : runStreamOnce(ctx));
+  // Self-describing cache metadata (idb/<hash>/meta.json): if a cold stream settled a fresh
+  // .i64, record what it is. Backfill only — don't churn an existing file's analyzedAt.
+  try {
+    const idbFile = idbPath(cacheDir, binHash, opts.module);
+    const metaFile = join(idbCacheDir(cacheDir, binHash, opts.module), 'meta.json');
+    if (existsSync(idbFile) && !existsSync(metaFile)) {
+      const s = statSync(effectiveBinary);
+      writeIdbMeta(cacheDir, binHash, opts.module, {
+        name: basename(opts.binary),
+        path: opts.binary,
+        ...(opts.arch ? { arch: opts.arch } : {}),
+        ...(opts.module ? { module: opts.module } : {}),
+        backend: 'ida',
+        backendVersion: null,
+        binHash,
+        analyzedAt: new Date(statSync(idbFile).mtimeMs).toISOString(),
+        mtimeMs: s.mtimeMs,
+        size: s.size,
+      });
+    }
+  } catch { /* metadata is best-effort */ }
+  return code;
 }
 
 // ─── Shared run context ────────────────────────────────────────────────────────────

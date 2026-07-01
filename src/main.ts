@@ -276,12 +276,13 @@ async function cmdCache(
         const idb = join(dir, 'binary.i64');
         if (!existsSync(idb)) return;
         const metaPath = join(dir, 'meta.json');
-        const meta = existsSync(metaPath)
-          ? JSON.parse(readFileSync(metaPath, 'utf8')) as { path: string; module?: string }
-          : { path: '(unknown)' };
+        const meta: { path?: string; arch?: string; module?: string; analyzedAt?: string } =
+          existsSync(metaPath) ? (() => { try { return JSON.parse(readFileSync(metaPath, 'utf8')); } catch { return {}; } })() : {};
         const size = (statSync(idb).size / 1048576).toFixed(1) + ' MB';
+        const arch = meta.arch ? ` [${meta.arch}]` : '';
         const tag = meta.module ? ` :: ${meta.module}` : '';
-        console.log(`  ${label}  ${truncPath(meta.path)}${tag}  (${size})`);
+        const when = meta.analyzedAt ? `, ${String(meta.analyzedAt).slice(0, 10)}` : '';
+        console.log(`  ${label}  ${truncPath(meta.path ?? '(unknown)')}${arch}${tag}  (${size}${when})`);
       };
       for (const hash of readdirSync(idbDir)) {
         const hashDir = join(idbDir, hash);
